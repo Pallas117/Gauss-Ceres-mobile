@@ -291,6 +291,9 @@ export interface TelemetryEvent {
   threatPct: number;        // 0–100
   altKm: number;
   velKms: number;
+  lat?: number;             // degrees, for orbital visualiser
+  lon?: number;             // degrees, for orbital visualiser
+  inclination?: number;     // degrees, for orbital ring placement
   isReal: true;
   isOperator?: boolean;
 }

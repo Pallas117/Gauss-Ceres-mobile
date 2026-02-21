@@ -134,3 +134,26 @@
 - [x] Expose parser stats to HUD console (cache hit rate, parse time, byte savings)
 - [x] Integrate parser into satellite-service.ts and solar-weather-service.ts
 - [x] Add CACHE command to actioning console to show parser performance stats
+
+## Scroll & Layout Fix
+
+- [x] Audit full layout structure — identified bentoGrid flex:1 as root cause
+- [x] Wrap all bento cards in a single outer ScrollView so the full HUD is scrollable
+- [x] Fix telemetry FlatList height — replaced FlatList with ScrollView+map inside outer ScrollView
+- [x] Fix Actioning Console height — capped at 200px natural height
+- [x] Fix Solar Weather card — renders fully in ScrollView
+- [x] Fix Orbital Arc card — renders fully at 160px height
+- [x] Ensure command input bar stays pinned to bottom, above keyboard
+- [x] Ensure urgent controls bar stays pinned above command input
+- [x] Test on iPhone 13 viewport (390×844) — all content accessible via scroll
+
+## Orbital Visualiser Upgrade
+
+- [x] Show real satellite positions as dots on orbital arcs (lat/lon → SVG equirectangular projection)
+- [x] Show only highest-risk satellites (top 12 by threatPct) in the visualiser
+- [x] Add data-age latency timer showing seconds since last TLE propagation
+- [x] Color-code satellite dots by threat level (volt=nominal, amber=warning, red=critical)
+- [x] Pulse-animate critical satellite dots (crosshair + glow ring)
+- [x] Show satellite name label next to each dot (top 6 by threat)
+- [x] Add orbit altitude ring labels (LEO / MEO / GEO) on the arc
+- [x] Show threat level and data age timer in orbital arc corners

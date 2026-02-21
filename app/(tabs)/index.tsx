@@ -29,7 +29,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import * as Haptics from "expo-haptics";
-import Svg, { Circle, Path, Line, Ellipse, Text as SvgText } from "react-native-svg";
+import Svg, { Circle, Path, Line, Ellipse, Rect, Text as SvgText } from "react-native-svg";
 import {
   fetchAllSatellites,
   propagateGP,
@@ -122,126 +122,223 @@ function genId() {
 }
 
 // ─── SVG Orbital Arc Visualiser ───────────────────────────────────────────────
-// Vector-first: renders real orbital inclination and position as SVG arcs.
-// AR/HUD-ready: pure vectors, no raster assets.
+// World-map equirectangular projection with real satellite positions.
+// Shows top-12 highest-risk satellites. AR/HUD-ready — pure SVG vectors.
 interface OrbitalArcProps {
   events: TelemetryEvent[];
   threatLevel: "NOMINAL" | "WARNING" | "CRISIS";
+  lastPropagated?: Date | null;
 }
 
-function OrbitalArcVisualiser({ events, threatLevel }: OrbitalArcProps) {
-  const W = SCREEN_W - 32;
-  const H = 110;
-  const cx = W / 2;
-  const cy = H / 2 + 8;
-  const rx = W * 0.42;
-  const ry = H * 0.32;
+// Convert geographic lat/lon to SVG x/y on an equirectangular projection
+function latLonToXY(lat: number, lon: number, W: number, H: number): { x: number; y: number } {
+  const x = ((lon + 180) / 360) * W;
+  const y = ((90 - lat) / 180) * H;
+  return { x, y };
+}
 
+function OrbitalArcVisualiser({ events, threatLevel, lastPropagated }: OrbitalArcProps) {
+  const W = SCREEN_W - 32;
+  const H = 160;
   const glowColor =
     threatLevel === "CRISIS"  ? C.RED  :
     threatLevel === "WARNING" ? C.AMBER : C.VOLT;
 
-  // Take up to 6 most recent real satellites for arc dots
-  const activeSats = events.slice(0, 6);
+  // Latency timer: seconds since last propagation
+  const [dataAgeSec, setDataAgeSec] = React.useState(0);
+  React.useEffect(() => {
+    const t = setInterval(() => {
+      if (lastPropagated) {
+        setDataAgeSec(Math.floor((Date.now() - lastPropagated.getTime()) / 1000));
+      }
+    }, 1000);
+    return () => clearInterval(t);
+  }, [lastPropagated]);
+
+  // Top 12 highest-risk satellites with real lat/lon
+  const riskySats = events
+    .filter(e => e.lat !== undefined && e.lon !== undefined && !e.isOperator)
+    .sort((a, b) => b.threatPct - a.threatPct)
+    .slice(0, 12);
+
+  // World map grid lines (equirectangular)
+  const latLines = [-60, -30, 0, 30, 60];
+  const lonLines = [-120, -60, 0, 60, 120];
+
+  // Orbit altitude rings (approximate equatorial projections)
+  // LEO ~400km, MEO ~20000km, GEO ~35786km — shown as horizontal bands
+  const orbitRings = [
+    { label: "LEO", yFrac: 0.35, opacity: 0.35 },
+    { label: "MEO", yFrac: 0.22, opacity: 0.22 },
+    { label: "GEO", yFrac: 0.08, opacity: 0.14 },
+  ];
 
   return (
-    <Svg width={W} height={H} viewBox={`0 0 ${W} ${H}`}>
-      {/* Earth circle */}
-      <Circle cx={cx} cy={cy} r={14} fill="#0A1A2A" stroke={C.BORDER2} strokeWidth={1} />
-      <Circle cx={cx} cy={cy} r={10} fill="#0D2A3A" />
-      <Circle cx={cx} cy={cy} r={5}  fill="#1A4A5A" />
+    <View>
+      <Svg width={W} height={H} viewBox={`0 0 ${W} ${H}`}>
+        {/* Background */}
+        <Rect x={0} y={0} width={W} height={H} fill="#000000" />
 
-      {/* Orbital rings — 3 inclinations */}
-      {[0.28, 0.38, 0.48].map((scale, i) => (
-        <Ellipse
-          key={i}
-          cx={cx}
-          cy={cy}
-          rx={rx * scale * 2.2}
-          ry={ry * scale * 1.8}
-          fill="none"
-          stroke={glowColor}
-          strokeWidth={0.5}
-          strokeOpacity={0.25 - i * 0.06}
-          strokeDasharray={i === 2 ? "3 4" : undefined}
-        />
-      ))}
+        {/* World map grid — equirectangular graticule */}
+        {latLines.map(lat => {
+          const { y } = latLonToXY(lat, 0, W, H);
+          return (
+            <Line
+              key={`lat${lat}`}
+              x1={0} y1={y} x2={W} y2={y}
+              stroke={C.BORDER2}
+              strokeWidth={lat === 0 ? 0.8 : 0.4}
+              strokeOpacity={lat === 0 ? 0.6 : 0.3}
+              strokeDasharray={lat === 0 ? undefined : "2 4"}
+            />
+          );
+        })}
+        {lonLines.map(lon => {
+          const { x } = latLonToXY(0, lon, W, H);
+          return (
+            <Line
+              key={`lon${lon}`}
+              x1={x} y1={0} x2={x} y2={H}
+              stroke={C.BORDER2}
+              strokeWidth={lon === 0 ? 0.8 : 0.4}
+              strokeOpacity={lon === 0 ? 0.6 : 0.3}
+              strokeDasharray={lon === 0 ? undefined : "2 4"}
+            />
+          );
+        })}
 
-      {/* Primary orbital path */}
-      <Ellipse
-        cx={cx}
-        cy={cy}
-        rx={rx}
-        ry={ry}
-        fill="none"
-        stroke={glowColor}
-        strokeWidth={1}
-        strokeOpacity={0.6}
-      />
+        {/* Orbit altitude rings as horizontal bands */}
+        {orbitRings.map(ring => {
+          const topY = ring.yFrac * H;
+          const botY = H - ring.yFrac * H;
+          return (
+            <React.Fragment key={ring.label}>
+              <Line x1={0} y1={topY} x2={W} y2={topY}
+                stroke={glowColor} strokeWidth={0.5} strokeOpacity={ring.opacity}
+                strokeDasharray="4 6"
+              />
+              <Line x1={0} y1={botY} x2={W} y2={botY}
+                stroke={glowColor} strokeWidth={0.5} strokeOpacity={ring.opacity}
+                strokeDasharray="4 6"
+              />
+              <SvgText x={4} y={topY - 2} fontSize={6} fill={glowColor}
+                fillOpacity={ring.opacity * 1.8} fontFamily={FONT.regular}>
+                {ring.label}
+              </SvgText>
+            </React.Fragment>
+          );
+        })}
 
-      {/* Satellite dots on primary orbit */}
-      {activeSats.map((sat, i) => {
-        // Map satellite position to angle on the ellipse
-        const angle = (i / Math.max(activeSats.length, 1)) * Math.PI * 2 - Math.PI / 2;
-        const x = cx + rx * Math.cos(angle);
-        const y = cy + ry * Math.sin(angle);
-        const color = EVENT_COLORS[sat.type] ?? C.VOLT;
-        const isCritical = sat.type === "CRITICAL" || sat.type === "ANOMALY";
+        {/* Satellite position dots */}
+        {riskySats.map((sat) => {
+          const { x, y } = latLonToXY(sat.lat!, sat.lon!, W, H);
+          const color = EVENT_COLORS[sat.type] ?? C.VOLT;
+          const isCritical = sat.threatPct >= DANGER_THRESHOLD;
+          const isHigh = sat.threatPct >= 50;
+          const r = isCritical ? 4 : isHigh ? 3 : 2;
 
-        return (
-          <React.Fragment key={sat.id}>
-            {isCritical && (
-              <Circle cx={x} cy={y} r={6} fill={color} fillOpacity={0.15} />
-            )}
-            <Circle cx={x} cy={y} r={isCritical ? 3 : 2} fill={color} fillOpacity={0.9} />
-            {/* Satellite name label */}
-            <SvgText
-              x={x + 5}
-              y={y - 4}
-              fontSize={6}
-              fill={color}
-              fillOpacity={0.7}
-              fontFamily={FONT.regular}
-            >
-              {sat.satName.slice(0, 8)}
-            </SvgText>
-          </React.Fragment>
-        );
-      })}
+          return (
+            <React.Fragment key={sat.id}>
+              {/* Glow ring for high-threat */}
+              {isCritical && (
+                <Circle cx={x} cy={y} r={r + 4} fill={color} fillOpacity={0.12} />
+              )}
+              {isHigh && !isCritical && (
+                <Circle cx={x} cy={y} r={r + 2} fill={color} fillOpacity={0.08} />
+              )}
+              {/* Main dot */}
+              <Circle cx={x} cy={y} r={r} fill={color} fillOpacity={0.95} />
+              {/* Crosshair for critical */}
+              {isCritical && (
+                <>
+                  <Line x1={x - 6} y1={y} x2={x - r - 1} y2={y} stroke={color} strokeWidth={0.8} strokeOpacity={0.7} />
+                  <Line x1={x + r + 1} y1={y} x2={x + 6} y2={y} stroke={color} strokeWidth={0.8} strokeOpacity={0.7} />
+                  <Line x1={x} y1={y - 6} x2={x} y2={y - r - 1} stroke={color} strokeWidth={0.8} strokeOpacity={0.7} />
+                  <Line x1={x} y1={y + r + 1} x2={x} y2={y + 6} stroke={color} strokeWidth={0.8} strokeOpacity={0.7} />
+                </>
+              )}
+              {/* Name label — only for top 6 */}
+              {riskySats.indexOf(sat) < 6 && (
+                <SvgText
+                  x={x + r + 2}
+                  y={y - 2}
+                  fontSize={6}
+                  fill={color}
+                  fillOpacity={0.85}
+                  fontFamily={FONT.regular}
+                >
+                  {sat.satName.slice(0, 10)}
+                </SvgText>
+              )}
+              {/* Threat % for critical */}
+              {isCritical && (
+                <SvgText
+                  x={x + r + 2}
+                  y={y + 7}
+                  fontSize={6}
+                  fill={color}
+                  fillOpacity={0.7}
+                  fontFamily={FONT.regular}
+                >
+                  {sat.threatPct}%
+                </SvgText>
+              )}
+            </React.Fragment>
+          );
+        })}
 
-      {/* Ground station marker */}
-      <Line x1={cx - 4} y1={cy + ry + 4} x2={cx + 4} y2={cy + ry + 4} stroke={C.VOLT} strokeWidth={1.5} />
-      <Line x1={cx} y1={cy + ry + 4} x2={cx} y2={cy + ry + 10} stroke={C.VOLT} strokeWidth={1.5} />
+        {/* Corner HUD brackets */}
+        {[
+          [4, 4, 14, 4, 4, 14],
+          [W - 4, 4, W - 14, 4, W - 4, 14],
+          [4, H - 4, 14, H - 4, 4, H - 14],
+          [W - 4, H - 4, W - 14, H - 4, W - 4, H - 14],
+        ].map(([x1, y1, x2, y2, x3, y3], i) => (
+          <Path
+            key={i}
+            d={`M${x1} ${y1} L${x2} ${y2} M${x1} ${y1} L${x3} ${y3}`}
+            stroke={glowColor}
+            strokeWidth={1.5}
+            strokeOpacity={0.6}
+          />
+        ))}
 
-      {/* Corner brackets — HUD frame */}
-      {[
-        [4, 4, 12, 4, 4, 12],
-        [W - 4, 4, W - 12, 4, W - 4, 12],
-        [4, H - 4, 12, H - 4, 4, H - 12],
-        [W - 4, H - 4, W - 12, H - 4, W - 4, H - 12],
-      ].map(([x1, y1, x2, y2, x3, y3], i) => (
-        <Path
-          key={i}
-          d={`M${x1} ${y1} L${x2} ${y2} M${x1} ${y1} L${x3} ${y3}`}
-          stroke={glowColor}
-          strokeWidth={1.5}
-          strokeOpacity={0.5}
-        />
-      ))}
+        {/* Threat level — top left */}
+        <SvgText x={6} y={12} fontSize={7} fill={glowColor} fillOpacity={0.8}
+          fontFamily={FONT.bold}>
+          {threatLevel}
+        </SvgText>
 
-      {/* Threat level label */}
-      <SvgText
-        x={W - 6}
-        y={H - 6}
-        fontSize={7}
-        fill={glowColor}
-        fillOpacity={0.6}
-        textAnchor="end"
-        fontFamily={FONT.regular}
-      >
-        {threatLevel}
-      </SvgText>
-    </Svg>
+        {/* Data age timer — top right */}
+        <SvgText x={W - 6} y={12} fontSize={7}
+          fill={dataAgeSec > 30 ? C.AMBER : C.MUTED}
+          fillOpacity={0.9}
+          textAnchor="end"
+          fontFamily={FONT.regular}
+        >
+          {lastPropagated ? `T+${dataAgeSec}s` : "ACQUIRING"}
+        </SvgText>
+
+        {/* Satellite count — bottom left */}
+        <SvgText x={6} y={H - 5} fontSize={6} fill={C.MUTED} fillOpacity={0.7}
+          fontFamily={FONT.regular}>
+          {`TOP ${riskySats.length} RISK`}
+        </SvgText>
+
+        {/* Equator label */}
+        <SvgText
+          x={W - 6}
+          y={H / 2 - 3}
+          fontSize={6}
+          fill={C.BORDER2}
+          fillOpacity={0.8}
+          textAnchor="end"
+          fontFamily={FONT.regular}
+        >
+          EQ
+        </SvgText>
+      </Svg>
+    </View>
   );
 }
 
@@ -503,6 +600,7 @@ export default function HUDScreen() {
   const [newEventIds, setNewEventIds]   = useState<Set<string>>(new Set());
   const [isFetchingTLE, setIsFetchingTLE] = useState(false);
   const [lastTLEFetch, setLastTLEFetch] = useState<Date | null>(null);
+  const [lastPropagated, setLastPropagated] = useState<Date | null>(null);
 
   const [consoleLog, setConsoleLog]     = useState<ConsoleEntry[]>([]);
   const [command, setCommand]           = useState("");
@@ -670,11 +768,15 @@ export default function HUDScreen() {
           threatPct: combinedThreat,
           altKm: state.altKm,
           velKms: state.velKms,
+          lat: state.lat,
+          lon: state.lon,
+          inclination: state.inclination,
           isReal: true as const,
         };
       })
       .sort((a, b) => b.threatPct - a.threatPct);
 
+    setLastPropagated(new Date());
     const merged = [...opTelemetry, ...computed].slice(0, 50);
 
     // Find new IDs
@@ -932,8 +1034,13 @@ export default function HUDScreen() {
           </View>
         )}
 
-        {/* ── BENTO BOX LAYOUT ── */}
-        <View style={styles.bentoGrid}>
+        {/* ── BENTO BOX LAYOUT — scrollable ── */}
+        <ScrollView
+          style={styles.bentoScroll}
+          contentContainerStyle={styles.bentoGrid}
+          showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
+        >
 
           {/* ── SOLAR WEATHER BENTO CARD ── */}
           {solarWeather && (
@@ -1030,17 +1137,16 @@ export default function HUDScreen() {
               labelRight={`${events.length} EVENTS`}
               accentColor={threatAccent}
             >
-              <OrbitalArcVisualiser events={events} threatLevel={threatLevel} />
+              <OrbitalArcVisualiser events={events} threatLevel={threatLevel} lastPropagated={lastPropagated} />
             </BentoCard>
           )}
 
           {/* ── TELEMETRY FEED ── */}
           <BentoCard
             label={showOrbitalArc ? "FEED" : "ORBITAL TELEMETRY · LIVE — TRAJECTORY HUD EXPANDED"}
-            labelRight={!showOrbitalArc ? `${events.length} EVENTS` : undefined}
+            labelRight={`${events.length} EVENTS`}
             accentColor={threatAccent}
             noPad
-            flex={showOrbitalArc ? undefined : 2}
           >
             {events.length === 0 ? (
               <View style={styles.emptyFeed}>
@@ -1049,23 +1155,17 @@ export default function HUDScreen() {
                 </Text>
               </View>
             ) : (
-              <FlatList
-                data={events}
-                keyExtractor={item => item.id}
-                renderItem={({ item }) => (
-                  <TelemetryRow item={item} isNew={newEventIds.has(item.id)} />
-                )}
-                style={styles.feedList}
-                showsVerticalScrollIndicator={false}
-                ListHeaderComponent={
-                  <View style={styles.feedHeader}>
-                    <Text style={styles.feedHeaderCell}>TIME</Text>
-                    <Text style={styles.feedHeaderCell}>TYPE</Text>
-                    <Text style={styles.feedHeaderCell}>SATELLITE</Text>
-                    <Text style={[styles.feedHeaderCell, { flex: 2 }]}>DETAIL / THREAT</Text>
-                  </View>
-                }
-              />
+              <View>
+                <View style={styles.feedHeader}>
+                  <Text style={styles.feedHeaderCell}>TIME</Text>
+                  <Text style={styles.feedHeaderCell}>TYPE</Text>
+                  <Text style={styles.feedHeaderCell}>SATELLITE</Text>
+                  <Text style={[styles.feedHeaderCell, { flex: 2 }]}>DETAIL / THREAT</Text>
+                </View>
+                {events.map(item => (
+                  <TelemetryRow key={item.id} item={item} isNew={newEventIds.has(item.id)} />
+                ))}
+              </View>
             )}
           </BentoCard>
 
@@ -1073,7 +1173,6 @@ export default function HUDScreen() {
           <BentoCard
             label="ACTIONING CONSOLE"
             accentColor={isReasoning ? C.AMBER : C.VOLT}
-            flex={1}
           >
             <ScrollView
               ref={consoleRef}
@@ -1110,7 +1209,7 @@ export default function HUDScreen() {
             </ScrollView>
           </BentoCard>
 
-        </View>
+        </ScrollView>
 
         {/* ── URGENT CONTROLS ── */}
         <View style={[styles.urgentBar, { borderTopColor: threatAccent }]}>
@@ -1285,11 +1384,14 @@ const styles = StyleSheet.create({
     letterSpacing: 0.8,
   },
 
-  // ── Bento grid ─────────────────────────────────────────────────────────────
-  bentoGrid: {
+   // ── Bento grid ──────────────────────────────────────────────────────
+  bentoScroll: {
     flex: 1,
+  },
+  bentoGrid: {
     paddingHorizontal: 8,
     paddingTop: 6,
+    paddingBottom: 12,
     gap: 6,
   },
   bentoCard: {
@@ -1327,9 +1429,10 @@ const styles = StyleSheet.create({
     padding: 8,
   },
 
-  // ── Telemetry feed ─────────────────────────────────────────────────────────
+    // ── Telemetry feed ─────────────────────────────────────────────────────
   feedList: {
-    maxHeight: 180,
+    // No maxHeight — let FlatList grow naturally inside ScrollView
+    // nestedScrollEnabled allows inner FlatList to scroll within outer ScrollView
   },
   feedHeader: {
     flexDirection: "row",
@@ -1444,9 +1547,10 @@ const styles = StyleSheet.create({
     letterSpacing: 0.5,
   },
 
-  // ── Console ────────────────────────────────────────────────────────────────
+   // ── Console ──────────────────────────────────────────────────────
   console: {
-    maxHeight: 120,
+    minHeight: 120,
+    maxHeight: 300,
   },
   consoleIdle: {
     fontFamily: FONT.regular,
