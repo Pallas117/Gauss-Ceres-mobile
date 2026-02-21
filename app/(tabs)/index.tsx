@@ -34,11 +34,13 @@ import {
   fetchAllSatellites,
   propagateGP,
   propagateGPDelta,
+  computeGroundTrack,
   classifyEvent,
   formatCoords,
   formatSatName,
   type TelemetryEvent,
   type CelesTrakGP,
+  type GroundTrackSegment,
 } from "@/lib/satellite-service";
 import {
   loadRiskEvents,
@@ -128,6 +130,7 @@ interface OrbitalArcProps {
   events: TelemetryEvent[];
   threatLevel: "NOMINAL" | "WARNING" | "CRISIS";
   lastPropagated?: Date | null;
+  groundTracks?: Array<{ segments: GroundTrackSegment[]; color: string; name: string; rank: number }>;
 }
 
 // Convert geographic lat/lon to SVG x/y on an equirectangular projection
@@ -137,7 +140,7 @@ function latLonToXY(lat: number, lon: number, W: number, H: number): { x: number
   return { x, y };
 }
 
-function OrbitalArcVisualiser({ events, threatLevel, lastPropagated }: OrbitalArcProps) {
+function OrbitalArcVisualiser({ events, threatLevel, lastPropagated, groundTracks = [] }: OrbitalArcProps) {
   const W = SCREEN_W - 32;
   const H = 160;
   const glowColor =
@@ -155,7 +158,7 @@ function OrbitalArcVisualiser({ events, threatLevel, lastPropagated }: OrbitalAr
     return () => clearInterval(t);
   }, [lastPropagated]);
 
-  // Top 12 highest-risk satellites with real lat/lon
+  // Top 12 highest-risk satellites with real lat/lon (for position dots)
   const riskySats = events
     .filter(e => e.lat !== undefined && e.lon !== undefined && !e.isOperator)
     .sort((a, b) => b.threatPct - a.threatPct)
@@ -228,6 +231,31 @@ function OrbitalArcVisualiser({ events, threatLevel, lastPropagated }: OrbitalAr
             </React.Fragment>
           );
         })}
+
+        {/* Ground tracks for top-3 riskiest satellites */}
+        {groundTracks.map((track) => (
+          <React.Fragment key={`track-${track.rank}`}>
+            {track.segments.map((seg, si) => {
+              if (seg.points.length < 2) return null;
+              // Build SVG polyline path string
+              const d = seg.points.map((p, pi) => {
+                const { x, y } = latLonToXY(p.lat, p.lon, W, H);
+                return `${pi === 0 ? 'M' : 'L'}${x.toFixed(1)} ${y.toFixed(1)}`;
+              }).join(' ');
+              return (
+                <Path
+                  key={`seg-${si}`}
+                  d={d}
+                  stroke={track.color}
+                  strokeWidth={track.rank === 1 ? 1.2 : 0.8}
+                  strokeOpacity={track.rank === 1 ? 0.7 : track.rank === 2 ? 0.55 : 0.4}
+                  fill="none"
+                  strokeDasharray={track.rank === 1 ? undefined : track.rank === 2 ? "3 3" : "2 4"}
+                />
+              );
+            })}
+          </React.Fragment>
+        ))}
 
         {/* Satellite position dots */}
         {riskySats.map((sat) => {
@@ -322,7 +350,7 @@ function OrbitalArcVisualiser({ events, threatLevel, lastPropagated }: OrbitalAr
         {/* Satellite count — bottom left */}
         <SvgText x={6} y={H - 5} fontSize={6} fill={C.MUTED} fillOpacity={0.7}
           fontFamily={FONT.regular}>
-          {`TOP ${riskySats.length} RISK`}
+          {groundTracks.length > 0 ? `TRACK: ${groundTracks.map(t => t.name.slice(0,8)).join(' · ')}` : `TOP ${riskySats.length} RISK`}
         </SvgText>
 
         {/* Equator label */}
@@ -601,6 +629,7 @@ export default function HUDScreen() {
   const [isFetchingTLE, setIsFetchingTLE] = useState(false);
   const [lastTLEFetch, setLastTLEFetch] = useState<Date | null>(null);
   const [lastPropagated, setLastPropagated] = useState<Date | null>(null);
+  const [groundTracks, setGroundTracks] = useState<Array<{ segments: GroundTrackSegment[]; color: string; name: string; rank: number }>>([]);
 
   const [consoleLog, setConsoleLog]     = useState<ConsoleEntry[]>([]);
   const [command, setCommand]           = useState("");
@@ -777,7 +806,24 @@ export default function HUDScreen() {
       .sort((a, b) => b.threatPct - a.threatPct);
 
     setLastPropagated(new Date());
-    const merged = [...opTelemetry, ...computed].slice(0, 50);
+
+    // Compute ground tracks for top-3 riskiest real satellites
+    const top3 = computed.slice(0, 3);
+    const TRACK_COLORS = [C.RED, C.AMBER, C.VOLT];
+    const newTracks = top3.map((evt, idx) => {
+      const gp = allGP.find(g => g.NORAD_CAT_ID === evt.noradId);
+      if (!gp) return null;
+      const segments = computeGroundTrack(gp, now, 45); // 45s step = ~200 points per orbit
+      return {
+        segments,
+        color: TRACK_COLORS[idx],
+        name: evt.satName,
+        rank: idx + 1,
+      };
+    }).filter(Boolean) as Array<{ segments: GroundTrackSegment[]; color: string; name: string; rank: number }>;
+    setGroundTracks(newTracks);
+
+    const merged = [...opTelemetry, ...computed].slice(0, 10);
 
     // Find new IDs
     setEvents(prev => {
@@ -1137,7 +1183,12 @@ export default function HUDScreen() {
               labelRight={`${events.length} EVENTS`}
               accentColor={threatAccent}
             >
-              <OrbitalArcVisualiser events={events} threatLevel={threatLevel} lastPropagated={lastPropagated} />
+              <OrbitalArcVisualiser
+                events={events}
+                threatLevel={threatLevel}
+                lastPropagated={lastPropagated}
+                groundTracks={groundTracks}
+              />
             </BentoCard>
           )}
 

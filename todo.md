@@ -157,3 +157,13 @@
 - [x] Show satellite name label next to each dot (top 6 by threat)
 - [x] Add orbit altitude ring labels (LEO / MEO / GEO) on the arc
 - [x] Show threat level and data age timer in orbital arc corners
+
+## Top-10 Feed & Orbital Ground Tracks
+
+- [x] Limit telemetry feed to top 10 highest-risk satellites only
+- [x] Compute orbital ground track (full orbit path) for top-3 riskiest satellites using SGP4 propagation over one orbital period
+- [x] Draw ground tracks as SVG polylines on the world-map visualiser
+- [x] Color-code each ground track by satellite rank (1st=red, 2nd=amber, 3rd=volt)
+- [x] Handle antimeridian crossing (lon wraps from 180 to -180) by splitting track into segments
+- [x] Label each ground track with satellite name and threat %
+- [x] Mark current position dot prominently on each track

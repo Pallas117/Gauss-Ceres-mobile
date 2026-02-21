@@ -318,3 +318,64 @@ export async function fetchAllSatellites(
   // Return all cached GP records (deduplicated by NORAD_CAT_ID)
   return dataParser.getAllGPs();
 }
+
+// ─── Ground Track Computation ─────────────────────────────────────────────────
+
+/**
+ * Compute the ground track (sub-satellite path) for one full orbital period.
+ * Samples the orbit every STEP_SEC seconds, returning lat/lon pairs.
+ * Handles antimeridian crossing by splitting into segments.
+ */
+export interface GroundTrackSegment {
+  points: Array<{ lat: number; lon: number }>;
+}
+
+export function computeGroundTrack(
+  gp: CelesTrakGP,
+  fromDate: Date = new Date(),
+  stepSec: number = 30
+): GroundTrackSegment[] {
+  const periodMin = 1440 / (gp.MEAN_MOTION || 14.0);
+  const periodMs = periodMin * 60 * 1000;
+  const stepMs = stepSec * 1000;
+  const steps = Math.ceil(periodMs / stepMs);
+
+  const rawPoints: Array<{ lat: number; lon: number }> = [];
+
+  for (let i = 0; i <= steps; i++) {
+    const t = new Date(fromDate.getTime() + i * stepMs);
+    try {
+      const state = propagateGP(gp, t);
+      if (!state.error) {
+        rawPoints.push({ lat: state.lat, lon: state.lon });
+      }
+    } catch {
+      // skip bad propagation steps
+    }
+  }
+
+  // Split into segments at antimeridian crossings (lon jump > 180°)
+  const segments: GroundTrackSegment[] = [];
+  let current: Array<{ lat: number; lon: number }> = [];
+
+  for (let i = 0; i < rawPoints.length; i++) {
+    if (i === 0) {
+      current.push(rawPoints[i]);
+      continue;
+    }
+    const prev = rawPoints[i - 1];
+    const curr = rawPoints[i];
+    const lonDiff = Math.abs(curr.lon - prev.lon);
+
+    if (lonDiff > 180) {
+      // Antimeridian crossing — end current segment and start new one
+      if (current.length > 1) segments.push({ points: current });
+      current = [curr];
+    } else {
+      current.push(curr);
+    }
+  }
+  if (current.length > 1) segments.push({ points: current });
+
+  return segments;
+}
