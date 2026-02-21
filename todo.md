@@ -49,3 +49,19 @@
 - [x] Add ACKNOWLEDGE button on danger flash to dismiss and log to console
 - [x] Urgent control buttons use distinct colors (red for ABORT, orange for ISOLATE, yellow for OVERRIDE, white for LOCKDOWN)
 - [x] Urgent controls panel is always visible above command input bar
+
+## Real Satellite Data Integration
+
+- [x] Research CelesTrak TLE feeds and available satellite groups
+- [x] Install satellite.js for SGP4/SDP4 orbital propagation
+- [x] Fetch live TLE data from CelesTrak for key satellite groups (stations, weather, GPS, Galileo, BeiDou, science, military)
+- [x] Compute real orbital positions (lat/lon/alt/velocity) from TLEs using satellite.js
+- [x] Compute real pass events classified by orbital state (LEO/MEO/GEO/decay risk)
+- [x] Replace mock telemetry events with real computed orbital state events
+- [x] Display real satellite names (from TLE line 0) instead of SAT-XXX IDs
+- [x] Display real coordinates (lat/lon) computed from propagation
+- [x] Display real altitude and velocity in telemetry detail
+- [x] Classify real event types based on orbital state (PASS/LOCK/SIGNAL/DRIFT/ANOMALY/CRITICAL)
+- [x] Add auto-refresh of TLE data every 6 hours (TLEs degrade over time)
+- [x] Show data source attribution (CelesTrak) in the HUD header and console
+- [x] Handle fetch errors gracefully with per-group error logging and degraded mode
