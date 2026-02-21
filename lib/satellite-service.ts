@@ -241,3 +241,39 @@ export function formatCoords(lat: number, lon: number): string {
 export function formatSatName(name: string): string {
   return name.trim().toUpperCase().slice(0, 14);
 }
+
+// ─── TelemetryEvent — unified feed event type ─────────────────────────────────
+export interface TelemetryEvent {
+  id: string;
+  timestamp: string;        // HH:MM:SS
+  type: RealEventType;
+  satName: string;          // Formatted satellite name
+  noradId: number;
+  coordinates: string;      // "45.1°N 90.2°E"
+  detail: string;           // Human-readable detail string
+  threatPct: number;        // 0–100
+  altKm: number;
+  velKms: number;
+  isReal: true;
+  isOperator?: boolean;
+}
+
+// ─── Fetch all satellite groups in parallel ───────────────────────────────────
+export async function fetchAllSatellites(): Promise<CelesTrakGP[]> {
+  const results = await Promise.allSettled(
+    SATELLITE_GROUPS.map(g => fetchGroupTLEs(g.key))
+  );
+  const all: CelesTrakGP[] = [];
+  for (const result of results) {
+    if (result.status === "fulfilled") {
+      all.push(...result.value);
+    }
+  }
+  // Deduplicate by NORAD_CAT_ID
+  const seen = new Set<number>();
+  return all.filter(gp => {
+    if (seen.has(gp.NORAD_CAT_ID)) return false;
+    seen.add(gp.NORAD_CAT_ID);
+    return true;
+  });
+}

@@ -1,16 +1,45 @@
+/**
+ * Gauss Design System (GDS) — Theme Configuration
+ *
+ * OLED-First Architecture: true black (#000000) background turns off pixels
+ * on OLED screens, extending mission battery life by up to 30%.
+ *
+ * Color Semantics:
+ *   Volt Green (#CCFF00) = NOMINAL / ONLINE / SUCCESS
+ *   Amber (#FFAA00)      = WARNING / ELEVATED
+ *   Red (#FF2222)        = CRISIS / CRITICAL / OFFLINE
+ *   White (#FFFFFF)      = PRIMARY TEXT / COMMANDS
+ */
+
 /** @type {const} */
-// Hard-Sovereign theme: Black #050505, Volt Green #CCFF00, White
 const themeColors = {
-  primary: { light: '#CCFF00', dark: '#CCFF00' },       // Volt Green
-  background: { light: '#050505', dark: '#050505' },     // Near-black
-  surface: { light: '#0D0D0D', dark: '#0D0D0D' },        // Slightly lighter black
-  foreground: { light: '#FFFFFF', dark: '#FFFFFF' },     // White
-  muted: { light: '#666666', dark: '#666666' },          // Dim text
-  border: { light: '#1A1A1A', dark: '#1A1A1A' },         // Dark border
-  success: { light: '#CCFF00', dark: '#CCFF00' },        // Volt Green = success
-  warning: { light: '#FF9900', dark: '#FF9900' },        // Orange
-  error: { light: '#FF3333', dark: '#FF3333' },          // Red
-  tint: { light: '#CCFF00', dark: '#CCFF00' },           // Tab tint
+  // ── Core GDS Palette ──────────────────────────────────────────────────────
+  primary:    { light: "#CCFF00", dark: "#CCFF00" },   // Volt Green — nominal state
+  background: { light: "#000000", dark: "#000000" },   // True OLED black
+  surface:    { light: "#0A0A0A", dark: "#0A0A0A" },   // Bento card background
+  surface2:   { light: "#111111", dark: "#111111" },   // Elevated surface
+  foreground: { light: "#FFFFFF", dark: "#FFFFFF" },   // Primary text
+  muted:      { light: "#666666", dark: "#666666" },   // Secondary text
+  border:     { light: "#1A1A1A", dark: "#1A1A1A" },   // Subtle dividers
+  border2:    { light: "#2A2A2A", dark: "#2A2A2A" },   // Visible dividers
+
+  // ── Status Colors ─────────────────────────────────────────────────────────
+  nominal:    { light: "#CCFF00", dark: "#CCFF00" },   // Volt Green
+  warning:    { light: "#FFAA00", dark: "#FFAA00" },   // Amber
+  crisis:     { light: "#FF2222", dark: "#FF2222" },   // Crisis Red
+
+  // ── Standard semantic aliases ─────────────────────────────────────────────
+  success:    { light: "#CCFF00", dark: "#CCFF00" },
+  error:      { light: "#FF2222", dark: "#FF2222" },
+  tint:       { light: "#CCFF00", dark: "#CCFF00" },
+
+  // ── Telemetry event type colors ───────────────────────────────────────────
+  pass:       { light: "#CCFF00", dark: "#CCFF00" },   // PASS — Volt Green
+  lock:       { light: "#00CCFF", dark: "#00CCFF" },   // LOCK — Cyan
+  signal:     { light: "#FFFFFF", dark: "#FFFFFF" },   // SIGNAL — White
+  drift:      { light: "#FFAA00", dark: "#FFAA00" },   // DRIFT — Amber
+  anomaly:    { light: "#FF6600", dark: "#FF6600" },   // ANOMALY — Orange
+  critical:   { light: "#FF2222", dark: "#FF2222" },   // CRITICAL — Red
 };
 
 module.exports = { themeColors };

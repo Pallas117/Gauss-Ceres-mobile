@@ -1,7 +1,15 @@
+/**
+ * Project Gauss — Mission HUD
+ * Gauss Design System (GDS) v1.0
+ *
+ * OLED-First · JetBrains Mono · Bento Box Layout · Contextual Generative UI
+ * 250ms Glanceability · Haptic Density · SVG Vector Architecture
+ */
+
 import React, {
-  useState,
   useEffect,
   useRef,
+  useState,
   useCallback,
   useMemo,
 } from "react";
@@ -10,963 +18,1412 @@ import {
   Text,
   TextInput,
   FlatList,
-  ScrollView,
   Pressable,
+  ScrollView,
   KeyboardAvoidingView,
   Platform,
-  StatusBar,
-  StyleSheet,
   Animated,
-  Easing,
+  StyleSheet,
   Dimensions,
-  Modal,
-  ActivityIndicator,
+  Alert,
 } from "react-native";
-import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
-import { useKeepAwake } from "expo-keep-awake";
+import { SafeAreaView } from "react-native-safe-area-context";
 import * as Haptics from "expo-haptics";
-
+import Svg, { Circle, Path, Line, Ellipse, Text as SvgText } from "react-native-svg";
 import {
-  fetchGroupTLEs,
+  fetchAllSatellites,
   propagateGP,
   classifyEvent,
   formatCoords,
   formatSatName,
-  SATELLITE_GROUPS,
+  type TelemetryEvent,
   type CelesTrakGP,
-  type OrbitalState,
-  type RealEventType,
 } from "@/lib/satellite-service";
+import {
+  loadRiskEvents,
+  operatorEventToTelemetry,
+  type OperatorRiskEvent,
+} from "@/lib/operator-store";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
-const TAILSCALE_IP = "100.x.x.x";
-const BASE_URL = `http://${TAILSCALE_IP}:8080`;
-const STATUS_URL = `${BASE_URL}/status`;
-const REASON_URL = `${BASE_URL}/reason`;
-const HEALTH_CHECK_INTERVAL = 10_000;
-const TLE_REFRESH_INTERVAL  = 6 * 60 * 60 * 1000; // 6 hours
-const PROPAGATION_INTERVAL  = 5_000;               // update positions every 5s
-const DANGER_THRESHOLD      = 75;
-const MAX_TELEMETRY_EVENTS  = 60;
-const MAX_SATS_PER_GROUP    = 12; // limit per group to keep feed manageable
+const TAILSCALE_IP = "100.x.x.x"; // Replace with your Tailscale IP
+const BASE_URL     = `http://${TAILSCALE_IP}:8080`;
+const HEALTH_URL   = `${BASE_URL}/status`;
+const REASON_URL   = `${BASE_URL}/reason`;
 
-// ─── Theme ────────────────────────────────────────────────────────────────────
+// ─── GDS Color Palette ────────────────────────────────────────────────────────
 const C = {
-  volt:    "#CCFF00",
-  black:   "#050505",
-  surface: "#0D0D0D",
-  surface2:"#111111",
-  white:   "#FFFFFF",
-  dim:     "#555555",
-  dim2:    "#333333",
-  border:  "#1C1C1C",
-  red:     "#FF2222",
-  redDim:  "#3A0000",
-  orange:  "#FF9900",
-  yellow:  "#FFCC00",
-  blue:    "#00CCFF",
-  green:   "#00FF88",
+  BLACK:    "#000000",
+  SURFACE:  "#0A0A0A",
+  SURFACE2: "#111111",
+  BORDER:   "#1A1A1A",
+  BORDER2:  "#2A2A2A",
+  WHITE:    "#FFFFFF",
+  MUTED:    "#666666",
+  MUTED2:   "#444444",
+  VOLT:     "#CCFF00",   // Nominal
+  AMBER:    "#FFAA00",   // Warning
+  RED:      "#FF2222",   // Crisis
+  CYAN:     "#00CCFF",   // Lock
+  ORANGE:   "#FF6600",   // Anomaly
+} as const;
+
+// ─── GDS Typography ───────────────────────────────────────────────────────────
+const FONT = {
+  regular: "JetBrainsMono_400Regular",
+  medium:  "JetBrainsMono_500Medium",
+  bold:    "JetBrainsMono_700Bold",
+} as const;
+
+// ─── Event type colors ────────────────────────────────────────────────────────
+const EVENT_COLORS: Record<string, string> = {
+  PASS:     C.VOLT,
+  LOCK:     C.CYAN,
+  SIGNAL:   C.WHITE,
+  DRIFT:    C.AMBER,
+  ANOMALY:  C.ORANGE,
+  CRITICAL: C.RED,
 };
+
+const DANGER_THRESHOLD = 75;
+const { width: SCREEN_W } = Dimensions.get("window");
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 type NodeStatus = "ONLINE" | "OFFLINE" | "CONNECTING";
 
-interface TelemetryEvent {
-  id: string;
-  timestamp: string;
-  type: RealEventType;
-  satName: string;
-  noradId: number;
-  coordinates: string;
-  detail: string;
-  threatPct: number;
-  altKm: number;
-  velKms: number;
-  isReal: true;
-}
-
 interface ConsoleEntry {
   id: string;
-  timestamp: string;
-  role: "system" | "user" | "response" | "alert" | "control";
+  time: string;
   text: string;
+  color?: string;
+  isBold?: boolean;
 }
-
-// ─── Urgent Controls ──────────────────────────────────────────────────────────
-const URGENT_CONTROLS = [
-  { id: "abort",    label: "ABORT",    color: C.red,    bg: C.redDim,  command: "ABORT — halt all active operations immediately" },
-  { id: "isolate",  label: "ISOLATE",  color: C.orange, bg: "#2A1500", command: "ISOLATE — sever uplink to compromised satellite" },
-  { id: "override", label: "OVERRIDE", color: C.yellow, bg: "#2A2000", command: "OVERRIDE — force manual control of node systems" },
-  { id: "lockdown", label: "LOCKDOWN", color: C.white,  bg: "#1A1A1A", command: "LOCKDOWN — engage full system security protocol" },
-] as const;
-
-// ─── Event type colors ────────────────────────────────────────────────────────
-const EVENT_TYPE_COLORS: Record<RealEventType, string> = {
-  PASS:     C.white,
-  ANOMALY:  C.orange,
-  LOCK:     C.volt,
-  SIGNAL:   C.yellow,
-  DRIFT:    "#FF7700",
-  CRITICAL: C.red,
-};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-function nowTime(): string {
+function nowTime() {
   return new Date().toISOString().slice(11, 19);
 }
-function uid(): string {
+
+function genId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 }
-function eventFromState(state: OrbitalState): TelemetryEvent {
-  const { type, detail, threatPct } = classifyEvent(state);
-  return {
-    id: uid(),
-    timestamp: nowTime(),
-    type,
-    satName: formatSatName(state.name),
-    noradId: state.noradId,
-    coordinates: formatCoords(state.lat, state.lon),
-    detail,
-    threatPct,
-    altKm: state.altKm,
-    velKms: state.velKms,
-    isReal: true,
-  };
+
+// ─── SVG Orbital Arc Visualiser ───────────────────────────────────────────────
+// Vector-first: renders real orbital inclination and position as SVG arcs.
+// AR/HUD-ready: pure vectors, no raster assets.
+interface OrbitalArcProps {
+  events: TelemetryEvent[];
+  threatLevel: "NOMINAL" | "WARNING" | "CRISIS";
 }
 
-// ─── Animated Blinking Dot ────────────────────────────────────────────────────
-function BlinkDot({ color }: { color: string }) {
-  const opacity = useRef(new Animated.Value(1)).current;
-  useEffect(() => {
-    const anim = Animated.loop(
-      Animated.sequence([
-        Animated.timing(opacity, { toValue: 0.15, duration: 600, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
-        Animated.timing(opacity, { toValue: 1,    duration: 600, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
-      ])
-    );
-    anim.start();
-    return () => anim.stop();
-  }, [opacity]);
-  return <Animated.View style={[styles.statusDot, { backgroundColor: color, opacity }]} />;
-}
+function OrbitalArcVisualiser({ events, threatLevel }: OrbitalArcProps) {
+  const W = SCREEN_W - 32;
+  const H = 110;
+  const cx = W / 2;
+  const cy = H / 2 + 8;
+  const rx = W * 0.42;
+  const ry = H * 0.32;
 
-// ─── Scan-line Overlay ────────────────────────────────────────────────────────
-function ScanLines() {
-  const { height } = Dimensions.get("window");
-  const lines = Math.ceil(height / 4);
+  const glowColor =
+    threatLevel === "CRISIS"  ? C.RED  :
+    threatLevel === "WARNING" ? C.AMBER : C.VOLT;
+
+  // Take up to 6 most recent real satellites for arc dots
+  const activeSats = events.slice(0, 6);
+
   return (
-    <View style={StyleSheet.absoluteFill} pointerEvents="none">
-      {Array.from({ length: lines }).map((_, i) => (
-        <View key={i} style={[styles.scanLine, { top: i * 4 }]} />
+    <Svg width={W} height={H} viewBox={`0 0 ${W} ${H}`}>
+      {/* Earth circle */}
+      <Circle cx={cx} cy={cy} r={14} fill="#0A1A2A" stroke={C.BORDER2} strokeWidth={1} />
+      <Circle cx={cx} cy={cy} r={10} fill="#0D2A3A" />
+      <Circle cx={cx} cy={cy} r={5}  fill="#1A4A5A" />
+
+      {/* Orbital rings — 3 inclinations */}
+      {[0.28, 0.38, 0.48].map((scale, i) => (
+        <Ellipse
+          key={i}
+          cx={cx}
+          cy={cy}
+          rx={rx * scale * 2.2}
+          ry={ry * scale * 1.8}
+          fill="none"
+          stroke={glowColor}
+          strokeWidth={0.5}
+          strokeOpacity={0.25 - i * 0.06}
+          strokeDasharray={i === 2 ? "3 4" : undefined}
+        />
       ))}
-    </View>
-  );
-}
 
-// ─── Threat Bar ───────────────────────────────────────────────────────────────
-function ThreatBar({ pct }: { pct: number }) {
-  const color = pct >= DANGER_THRESHOLD ? C.red : pct >= 40 ? C.orange : C.dim2;
-  return (
-    <View style={styles.threatBarBg}>
-      <View style={[styles.threatBarFill, { width: `${pct}%` as any, backgroundColor: color }]} />
-    </View>
-  );
-}
+      {/* Primary orbital path */}
+      <Ellipse
+        cx={cx}
+        cy={cy}
+        rx={rx}
+        ry={ry}
+        fill="none"
+        stroke={glowColor}
+        strokeWidth={1}
+        strokeOpacity={0.6}
+      />
 
-// ─── Simple Markdown Renderer ─────────────────────────────────────────────────
-function MarkdownText({ text }: { text: string }) {
-  const lines = text.split("\n");
-  return (
-    <View>
-      {lines.map((line, i) => {
-        if (line.startsWith("# "))
-          return <Text key={i} style={styles.mdH1}>{line.slice(2).toUpperCase()}</Text>;
-        if (line.startsWith("## "))
-          return <Text key={i} style={styles.mdH2}>{line.slice(3).toUpperCase()}</Text>;
-        if (line.startsWith("- ") || line.startsWith("* "))
-          return <Text key={i} style={styles.mdList}>{"›  "}{renderInline(line.slice(2))}</Text>;
-        if (line.startsWith("    ") || line.startsWith("\t"))
-          return <Text key={i} style={styles.mdCodeLine}>{line.trimStart()}</Text>;
-        if (line.trim() === "")
-          return <View key={i} style={{ height: 5 }} />;
-        return <Text key={i} style={styles.mdParagraph}>{renderInline(line)}</Text>;
+      {/* Satellite dots on primary orbit */}
+      {activeSats.map((sat, i) => {
+        // Map satellite position to angle on the ellipse
+        const angle = (i / Math.max(activeSats.length, 1)) * Math.PI * 2 - Math.PI / 2;
+        const x = cx + rx * Math.cos(angle);
+        const y = cy + ry * Math.sin(angle);
+        const color = EVENT_COLORS[sat.type] ?? C.VOLT;
+        const isCritical = sat.type === "CRITICAL" || sat.type === "ANOMALY";
+
+        return (
+          <React.Fragment key={sat.id}>
+            {isCritical && (
+              <Circle cx={x} cy={y} r={6} fill={color} fillOpacity={0.15} />
+            )}
+            <Circle cx={x} cy={y} r={isCritical ? 3 : 2} fill={color} fillOpacity={0.9} />
+            {/* Satellite name label */}
+            <SvgText
+              x={x + 5}
+              y={y - 4}
+              fontSize={6}
+              fill={color}
+              fillOpacity={0.7}
+              fontFamily={FONT.regular}
+            >
+              {sat.satName.slice(0, 8)}
+            </SvgText>
+          </React.Fragment>
+        );
       })}
+
+      {/* Ground station marker */}
+      <Line x1={cx - 4} y1={cy + ry + 4} x2={cx + 4} y2={cy + ry + 4} stroke={C.VOLT} strokeWidth={1.5} />
+      <Line x1={cx} y1={cy + ry + 4} x2={cx} y2={cy + ry + 10} stroke={C.VOLT} strokeWidth={1.5} />
+
+      {/* Corner brackets — HUD frame */}
+      {[
+        [4, 4, 12, 4, 4, 12],
+        [W - 4, 4, W - 12, 4, W - 4, 12],
+        [4, H - 4, 12, H - 4, 4, H - 12],
+        [W - 4, H - 4, W - 12, H - 4, W - 4, H - 12],
+      ].map(([x1, y1, x2, y2, x3, y3], i) => (
+        <Path
+          key={i}
+          d={`M${x1} ${y1} L${x2} ${y2} M${x1} ${y1} L${x3} ${y3}`}
+          stroke={glowColor}
+          strokeWidth={1.5}
+          strokeOpacity={0.5}
+        />
+      ))}
+
+      {/* Threat level label */}
+      <SvgText
+        x={W - 6}
+        y={H - 6}
+        fontSize={7}
+        fill={glowColor}
+        fillOpacity={0.6}
+        textAnchor="end"
+        fontFamily={FONT.regular}
+      >
+        {threatLevel}
+      </SvgText>
+    </Svg>
+  );
+}
+
+// ─── Status Glow Badge ────────────────────────────────────────────────────────
+function StatusGlow({ status }: { status: NodeStatus }) {
+  const pulse = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    if (status === "CONNECTING") {
+      const anim = Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulse, { toValue: 0.2, duration: 600, useNativeDriver: true }),
+          Animated.timing(pulse, { toValue: 1,   duration: 600, useNativeDriver: true }),
+        ])
+      );
+      anim.start();
+      return () => anim.stop();
+    } else if (status === "ONLINE") {
+      const anim = Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulse, { toValue: 0.5, duration: 2000, useNativeDriver: true }),
+          Animated.timing(pulse, { toValue: 1,   duration: 2000, useNativeDriver: true }),
+        ])
+      );
+      anim.start();
+      return () => anim.stop();
+    } else {
+      pulse.setValue(1);
+    }
+  }, [status, pulse]);
+
+  const color =
+    status === "ONLINE"      ? C.VOLT  :
+    status === "CONNECTING"  ? C.AMBER : C.RED;
+
+  return (
+    <View style={styles.statusGlowWrap}>
+      <Animated.View
+        style={[
+          styles.statusGlowRing,
+          { borderColor: color, opacity: pulse },
+        ]}
+      />
+      <View style={[styles.statusDot, { backgroundColor: color }]} />
     </View>
   );
 }
-function renderInline(text: string): React.ReactNode {
-  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
-  return parts.map((p, i) => {
-    if (p.startsWith("**") && p.endsWith("**"))
-      return <Text key={i} style={styles.mdBold}>{p.slice(2, -2)}</Text>;
-    if (p.startsWith("`") && p.endsWith("`"))
-      return <Text key={i} style={styles.mdCode}>{p.slice(1, -1)}</Text>;
-    return p;
-  });
+
+// ─── Bento Card ───────────────────────────────────────────────────────────────
+interface BentoCardProps {
+  label: string;
+  labelRight?: string;
+  labelColor?: string;
+  children: React.ReactNode;
+  flex?: number;
+  noPad?: boolean;
+  accentColor?: string;
 }
 
-// ─── Console Entry ────────────────────────────────────────────────────────────
-function ConsoleEntryRow({ entry }: { entry: ConsoleEntry }) {
-  const fadeAnim = useRef(new Animated.Value(0)).current;
+function BentoCard({ label, labelRight, labelColor, children, flex, noPad, accentColor }: BentoCardProps) {
+  return (
+    <View style={[styles.bentoCard, flex ? { flex } : undefined]}>
+      {/* Top accent line */}
+      <View style={[styles.bentoAccent, { backgroundColor: accentColor ?? C.VOLT }]} />
+      {/* Header */}
+      <View style={styles.bentoHeader}>
+        <Text style={[styles.bentoLabel, labelColor ? { color: labelColor } : undefined]}>
+          {label}
+        </Text>
+        {labelRight ? (
+          <Text style={[styles.bentoLabelRight, labelColor ? { color: labelColor } : undefined]}>
+            {labelRight}
+          </Text>
+        ) : null}
+      </View>
+      {/* Content */}
+      <View style={noPad ? undefined : styles.bentoPad}>
+        {children}
+      </View>
+    </View>
+  );
+}
+
+// ─── Telemetry Row ────────────────────────────────────────────────────────────
+interface TelemetryRowProps {
+  item: TelemetryEvent;
+  isNew: boolean;
+}
+
+function TelemetryRow({ item, isNew }: TelemetryRowProps) {
+  const fadeAnim = useRef(new Animated.Value(isNew ? 0 : 1)).current;
+  const color = EVENT_COLORS[item.type] ?? C.VOLT;
+  const isCritical = item.threatPct >= DANGER_THRESHOLD;
+
   useEffect(() => {
-    Animated.timing(fadeAnim, {
-      toValue: 1, duration: 200, useNativeDriver: true,
-      easing: Easing.out(Easing.ease),
-    }).start();
-  }, [fadeAnim]);
-
-  const prefixColor =
-    entry.role === "user"    ? C.volt :
-    entry.role === "alert"   ? C.red :
-    entry.role === "control" ? C.orange :
-    entry.role === "system"  ? C.dim :
-    C.white;
-
-  const prefix =
-    entry.role === "user"    ? `[${entry.timestamp}] > ` :
-    entry.role === "alert"   ? `[${entry.timestamp}] !! ` :
-    entry.role === "control" ? `[${entry.timestamp}] >> ` :
-    entry.role === "system"  ? `[${entry.timestamp}] -- ` :
-    `[${entry.timestamp}]    `;
+    if (isNew) {
+      Animated.timing(fadeAnim, {
+        toValue: 1,
+        duration: 300,
+        useNativeDriver: true,
+      }).start();
+    }
+  }, [isNew, fadeAnim]);
 
   return (
-    <Animated.View style={[styles.consoleRow, { opacity: fadeAnim }]}>
-      <Text style={[styles.consolePrefix, { color: prefixColor }]}>{prefix}</Text>
-      <View style={styles.consoleBody}>
-        <MarkdownText text={entry.text} />
+    <Animated.View
+      style={[
+        styles.telemetryRow,
+        isCritical && styles.telemetryRowCritical,
+        { opacity: fadeAnim },
+      ]}
+    >
+      {/* Left threat indicator bar */}
+      <View
+        style={[
+          styles.telemetryBar,
+          { backgroundColor: color, opacity: isCritical ? 1 : 0.5 },
+        ]}
+      />
+      <View style={styles.telemetryContent}>
+        {/* Time + Type */}
+        <View style={styles.telemetryMeta}>
+          <Text style={styles.telemetryTime}>{item.timestamp.slice(0, 5)}</Text>
+          <View style={[styles.typeBadge, { borderColor: color }]}>
+            <Text style={[styles.typeBadgeText, { color }]}>{item.type}</Text>
+          </View>
+          {(item as any).isOperator && (
+            <View style={styles.opBadge}>
+              <Text style={styles.opBadgeText}>OP</Text>
+            </View>
+          )}
+        </View>
+        {/* Satellite name + detail */}
+        <View style={styles.telemetryBody}>
+          <Text style={styles.telemetrySatName} numberOfLines={1}>
+            {item.satName}
+          </Text>
+          <Text style={styles.telemetryDetail} numberOfLines={1}>
+            {item.detail}
+          </Text>
+        </View>
+        {/* Threat bar */}
+        <View style={styles.threatBarWrap}>
+          <View style={[styles.threatBarFill, { width: `${item.threatPct}%` as any, backgroundColor: color }]} />
+          <Text style={[styles.threatPct, { color }]}>{item.threatPct}%</Text>
+        </View>
       </View>
     </Animated.View>
   );
 }
 
 // ─── Danger Flash Overlay ─────────────────────────────────────────────────────
-function DangerFlash({
-  event,
-  onAcknowledge,
-}: {
+interface DangerFlashProps {
   event: TelemetryEvent;
   onAcknowledge: () => void;
-}) {
-  const strobeAnim = useRef(new Animated.Value(0)).current;
-  const scaleAnim  = useRef(new Animated.Value(0.92)).current;
-
-  useEffect(() => {
-    const strobe = Animated.loop(
-      Animated.sequence([
-        Animated.timing(strobeAnim, { toValue: 1, duration: 120, useNativeDriver: true }),
-        Animated.timing(strobeAnim, { toValue: 0, duration: 120, useNativeDriver: true }),
-        Animated.timing(strobeAnim, { toValue: 1, duration: 120, useNativeDriver: true }),
-        Animated.timing(strobeAnim, { toValue: 0, duration: 400, useNativeDriver: true }),
-      ]),
-      { iterations: 4 }
-    );
-    const entrance = Animated.spring(scaleAnim, {
-      toValue: 1, tension: 200, friction: 15, useNativeDriver: true,
-    });
-    strobe.start();
-    entrance.start();
-    if (Platform.OS !== "web") {
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-    }
-    return () => { strobe.stop(); };
-  }, [strobeAnim, scaleAnim]);
-
-  const bgOpacity     = strobeAnim.interpolate({ inputRange: [0, 1], outputRange: [0.88, 0.97] });
-  const borderOpacity = strobeAnim.interpolate({ inputRange: [0, 1], outputRange: [0.6, 1] });
-
-  return (
-    <Modal transparent animationType="fade" statusBarTranslucent>
-      <Animated.View style={[styles.dangerOverlay, { opacity: bgOpacity }]}>
-        <Animated.View style={[styles.dangerCard, { transform: [{ scale: scaleAnim }] }]}>
-          <Animated.View style={[styles.dangerTopBar, { opacity: borderOpacity }]} />
-
-          <View style={styles.dangerHeader}>
-            <Text style={styles.dangerLabel}>⚠ THREAT DETECTED</Text>
-            <Text style={styles.dangerThreatPct}>{event.threatPct}%</Text>
-          </View>
-
-          <View style={styles.dangerInfoGrid}>
-            <View style={styles.dangerInfoCell}>
-              <Text style={styles.dangerInfoLabel}>TYPE</Text>
-              <Text style={[styles.dangerInfoValue, { color: EVENT_TYPE_COLORS[event.type] }]}>
-                {event.type}
-              </Text>
-            </View>
-            <View style={styles.dangerInfoCell}>
-              <Text style={styles.dangerInfoLabel}>ASSET</Text>
-              <Text style={styles.dangerInfoValue}>{event.satName}</Text>
-            </View>
-            <View style={styles.dangerInfoCell}>
-              <Text style={styles.dangerInfoLabel}>NORAD ID</Text>
-              <Text style={styles.dangerInfoValue}>{event.noradId}</Text>
-            </View>
-            <View style={styles.dangerInfoCell}>
-              <Text style={styles.dangerInfoLabel}>POSITION</Text>
-              <Text style={styles.dangerInfoValue}>{event.coordinates}</Text>
-            </View>
-            {event.altKm > 0 && (
-              <View style={styles.dangerInfoCell}>
-                <Text style={styles.dangerInfoLabel}>ALTITUDE</Text>
-                <Text style={styles.dangerInfoValue}>{event.altKm.toFixed(0)} km</Text>
-              </View>
-            )}
-            {event.velKms > 0 && (
-              <View style={styles.dangerInfoCell}>
-                <Text style={styles.dangerInfoLabel}>VELOCITY</Text>
-                <Text style={styles.dangerInfoValue}>{event.velKms.toFixed(2)} km/s</Text>
-              </View>
-            )}
-          </View>
-
-          <View style={styles.dangerDetail}>
-            <Text style={styles.dangerDetailText}>{event.detail}</Text>
-          </View>
-
-          <View style={styles.dangerThreatSection}>
-            <Text style={styles.dangerInfoLabel}>THREAT PROBABILITY</Text>
-            <View style={styles.dangerThreatBarBg}>
-              <Animated.View
-                style={[styles.dangerThreatBarFill, { width: `${event.threatPct}%` as any, opacity: borderOpacity }]}
-              />
-            </View>
-            <Text style={styles.dangerThreatPctLabel}>{event.threatPct}% CONFIDENCE · NORAD #{event.noradId}</Text>
-          </View>
-
-          <View style={styles.dangerControls}>
-            {URGENT_CONTROLS.map(ctrl => (
-              <Pressable
-                key={ctrl.id}
-                style={({ pressed }) => [
-                  styles.dangerCtrlBtn,
-                  { borderColor: ctrl.color, backgroundColor: pressed ? ctrl.color + "33" : ctrl.bg },
-                ]}
-                onPress={() => {
-                  if (Platform.OS !== "web") Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-                  onAcknowledge();
-                }}
-              >
-                <Text style={[styles.dangerCtrlText, { color: ctrl.color }]}>{ctrl.label}</Text>
-              </Pressable>
-            ))}
-          </View>
-
-          <Pressable
-            style={({ pressed }) => [styles.dangerAckBtn, pressed && { opacity: 0.7 }]}
-            onPress={() => {
-              if (Platform.OS !== "web") Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-              onAcknowledge();
-            }}
-          >
-            <Text style={styles.dangerAckText}>ACKNOWLEDGE & DISMISS</Text>
-          </Pressable>
-
-          <Animated.View style={[styles.dangerTopBar, { opacity: borderOpacity }]} />
-        </Animated.View>
-      </Animated.View>
-    </Modal>
-  );
+  onUrgentAction: (action: string) => void;
 }
 
-// ─── Telemetry Row ────────────────────────────────────────────────────────────
-const TelemetryRow = React.memo(function TelemetryRow({ item }: { item: TelemetryEvent }) {
-  const fadeAnim  = useRef(new Animated.Value(0)).current;
-  const pulseAnim = useRef(new Animated.Value(1)).current;
-  const isHighThreat = item.threatPct >= DANGER_THRESHOLD;
+function DangerFlashOverlay({ event, onAcknowledge, onUrgentAction }: DangerFlashProps) {
+  const strobe = useRef(new Animated.Value(1)).current;
+  const color = EVENT_COLORS[event.type] ?? C.RED;
 
-  useEffect(() => {
-    Animated.timing(fadeAnim, {
-      toValue: 1, duration: 250, useNativeDriver: true,
-      easing: Easing.out(Easing.ease),
-    }).start();
-    if (isHighThreat) {
-      const pulse = Animated.loop(
-        Animated.sequence([
-          Animated.timing(pulseAnim, { toValue: 0.3, duration: 400, useNativeDriver: true }),
-          Animated.timing(pulseAnim, { toValue: 1,   duration: 400, useNativeDriver: true }),
-        ])
-      );
-      pulse.start();
-      return () => pulse.stop();
-    }
-  }, [fadeAnim, pulseAnim, isHighThreat]);
-
-  const typeColor = EVENT_TYPE_COLORS[item.type];
-
-  return (
-    <Animated.View style={[styles.telemetryRow, isHighThreat && styles.telemetryRowDanger, { opacity: fadeAnim }]}>
-      {isHighThreat && <Animated.View style={[styles.telemetryDangerBorder, { opacity: pulseAnim }]} />}
-      <Text style={styles.telemetryTime}>{item.timestamp}</Text>
-      <Text style={[styles.telemetryType, { color: typeColor }]}>{item.type.padEnd(8)}</Text>
-      <Text style={styles.telemetrySat} numberOfLines={1}>{item.satName}</Text>
-      <View style={styles.telemetryRight}>
-        <Text style={styles.telemetryDetail} numberOfLines={1}>{item.detail}</Text>
-        <ThreatBar pct={item.threatPct} />
-      </View>
-    </Animated.View>
-  );
-});
-
-// ─── Blinking Cursor ──────────────────────────────────────────────────────────
-function BlinkingCursor() {
-  const opacity = useRef(new Animated.Value(1)).current;
   useEffect(() => {
     const anim = Animated.loop(
       Animated.sequence([
-        Animated.timing(opacity, { toValue: 0, duration: 500, useNativeDriver: true }),
-        Animated.timing(opacity, { toValue: 1, duration: 500, useNativeDriver: true }),
+        Animated.timing(strobe, { toValue: 0.05, duration: 120, useNativeDriver: true }),
+        Animated.timing(strobe, { toValue: 1,    duration: 120, useNativeDriver: true }),
+        Animated.timing(strobe, { toValue: 0.05, duration: 120, useNativeDriver: true }),
+        Animated.timing(strobe, { toValue: 1,    duration: 800, useNativeDriver: true }),
       ])
     );
     anim.start();
     return () => anim.stop();
-  }, [opacity]);
-  return <Animated.View style={[styles.cursor, { opacity }]} />;
-}
-
-// ─── Main HUD Screen ──────────────────────────────────────────────────────────
-export default function HUDScreen() {
-  useKeepAwake();
-  const insets = useSafeAreaInsets();
-
-  // Node status
-  const [nodeStatus, setNodeStatus]   = useState<NodeStatus>("CONNECTING");
-  const [latencyMs, setLatencyMs]     = useState<number | null>(null);
-  const [lastChecked, setLastChecked] = useState("--:--:--");
-  const [pingCount, setPingCount]     = useState(0);
-
-  // Satellite data
-  const [gpData, setGpData]           = useState<CelesTrakGP[]>([]);
-  const [tleLoading, setTleLoading]   = useState(true);
-  const [tleError, setTleError]       = useState<string | null>(null);
-  const [lastTleRefresh, setLastTleRefresh] = useState<Date | null>(null);
-  const [activeGroup, setActiveGroup] = useState(0);
-  const [satCount, setSatCount]       = useState(0);
-
-  // Telemetry feed
-  const [telemetry, setTelemetry]     = useState<TelemetryEvent[]>([]);
-
-  // Console
-  const [consoleLog, setConsoleLog]   = useState<ConsoleEntry[]>([
-    { id: uid(), timestamp: nowTime(), role: "system", text: "GAUSS MISSION HUD ONLINE. JUDITH M1 NODE INITIALIZING..." },
-    { id: uid(), timestamp: nowTime(), role: "system", text: "Fetching live TLE data from CelesTrak..." },
-  ]);
-  const [command, setCommand]         = useState("");
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [dangerEvent, setDangerEvent] = useState<TelemetryEvent | null>(null);
-  const [acknowledgedIds]             = useState(new Set<string>());
-
-  const consoleScrollRef  = useRef<ScrollView>(null);
-  const healthIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const tleIntervalRef    = useRef<ReturnType<typeof setInterval> | null>(null);
-  const propIntervalRef   = useRef<ReturnType<typeof setInterval> | null>(null);
-  const gpDataRef         = useRef<CelesTrakGP[]>([]);
-  const headerFlashAnim   = useRef(new Animated.Value(0)).current;
-  const inputRef          = useRef<TextInput>(null);
-
-  // ── Header flash ─────────────────────────────────────────────────────────────
-  const flashHeader = useCallback(() => {
-    Animated.sequence([
-      Animated.timing(headerFlashAnim, { toValue: 1, duration: 80,  useNativeDriver: true }),
-      Animated.timing(headerFlashAnim, { toValue: 0, duration: 300, useNativeDriver: true }),
-    ]).start();
-  }, [headerFlashAnim]);
-
-  // ── Append to console ─────────────────────────────────────────────────────────
-  const appendConsole = useCallback((role: ConsoleEntry["role"], text: string) => {
-    setConsoleLog(prev => [...prev, { id: uid(), timestamp: nowTime(), role, text }]);
-  }, []);
-
-  // ── Health Check ──────────────────────────────────────────────────────────────
-  const runHealthCheck = useCallback(async () => {
-    const start = Date.now();
-    try {
-      const res = await fetch(STATUS_URL, {
-        method: "GET",
-        signal: AbortSignal.timeout(5000),
-      });
-      const latency = Date.now() - start;
-      setNodeStatus(res.ok ? "ONLINE" : "OFFLINE");
-      setLatencyMs(res.ok ? latency : null);
-    } catch {
-      setNodeStatus("OFFLINE");
-      setLatencyMs(null);
-    }
-    setLastChecked(nowTime());
-    setPingCount(c => c + 1);
-    flashHeader();
-  }, [flashHeader]);
-
-  // ── Fetch TLE data from CelesTrak ─────────────────────────────────────────────
-  const fetchTLEData = useCallback(async () => {
-    setTleLoading(true);
-    setTleError(null);
-    const allGP: CelesTrakGP[] = [];
-    let successCount = 0;
-
-    for (const group of SATELLITE_GROUPS) {
-      try {
-        const data = await fetchGroupTLEs(group.key, AbortSignal.timeout(15000));
-        // Take a representative sample from each group
-        const sample = data.slice(0, MAX_SATS_PER_GROUP);
-        allGP.push(...sample);
-        successCount++;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : "Unknown";
-        appendConsole("alert", `TLE fetch failed for ${group.label}: ${msg}`);
-      }
-    }
-
-    if (allGP.length > 0) {
-      setGpData(allGP);
-      gpDataRef.current = allGP;
-      setSatCount(allGP.length);
-      setLastTleRefresh(new Date());
-      setTleLoading(false);
-      appendConsole("system",
-        `TLE data loaded: **${allGP.length} satellites** across ${successCount}/${SATELLITE_GROUPS.length} groups.\n` +
-        `Source: CelesTrak (celestrak.org) · Dr. T.S. Kelso\n` +
-        `Propagation: SGP4/SDP4 via satellite.js v6`
-      );
-      // Generate initial telemetry from first batch of satellites
-      const initialEvents = allGP.slice(0, 20).map(gp => {
-        const state = propagateGP(gp);
-        return eventFromState(state);
-      });
-      setTelemetry(initialEvents);
-    } else {
-      setTleError("All TLE fetches failed. Check network connectivity.");
-      setTleLoading(false);
-      appendConsole("alert", "CELESTRAK FETCH FAILED — No TLE data available. Operating in degraded mode.");
-    }
-  }, [appendConsole]);
-
-  // ── Propagation loop — update positions every 5s ──────────────────────────────
-  const runPropagation = useCallback(() => {
-    const gps = gpDataRef.current;
-    if (gps.length === 0) return;
-
-    // Pick a random satellite from the pool and propagate it
-    const gp = gps[Math.floor(Math.random() * gps.length)];
-    const state = propagateGP(gp, new Date());
-    if (state.error) return;
-
-    const event = eventFromState(state);
-    setTelemetry(prev => [event, ...prev].slice(0, MAX_TELEMETRY_EVENTS));
-
-    // Trigger danger flash for high-threat events
-    if (event.threatPct >= DANGER_THRESHOLD && !acknowledgedIds.has(event.id)) {
-      setDangerEvent(event);
-    }
-  }, [acknowledgedIds]);
-
-  // ── Effects ───────────────────────────────────────────────────────────────────
-  useEffect(() => {
-    // Start health check
-    runHealthCheck();
-    healthIntervalRef.current = setInterval(runHealthCheck, HEALTH_CHECK_INTERVAL);
-
-    // Fetch TLE data immediately
-    fetchTLEData();
-
-    // Refresh TLEs every 6 hours
-    tleIntervalRef.current = setInterval(fetchTLEData, TLE_REFRESH_INTERVAL);
-
-    return () => {
-      if (healthIntervalRef.current) clearInterval(healthIntervalRef.current);
-      if (tleIntervalRef.current)    clearInterval(tleIntervalRef.current);
-      if (propIntervalRef.current)   clearInterval(propIntervalRef.current);
-    };
-  }, [runHealthCheck, fetchTLEData]);
-
-  // Start propagation loop once TLE data is loaded
-  useEffect(() => {
-    if (gpData.length === 0) return;
-    if (propIntervalRef.current) clearInterval(propIntervalRef.current);
-    propIntervalRef.current = setInterval(runPropagation, PROPAGATION_INTERVAL);
-    return () => {
-      if (propIntervalRef.current) clearInterval(propIntervalRef.current);
-    };
-  }, [gpData.length, runPropagation]);
-
-  // Auto-scroll console
-  useEffect(() => {
-    const t = setTimeout(() => consoleScrollRef.current?.scrollToEnd({ animated: true }), 80);
-    return () => clearTimeout(t);
-  }, [consoleLog]);
-
-  // ── Send Command ──────────────────────────────────────────────────────────────
-  const sendCommand = useCallback(async (cmdOverride?: string) => {
-    const trimmed = (cmdOverride ?? command).trim();
-    if (!trimmed || isProcessing) return;
-    if (!cmdOverride) setCommand("");
-
-    if (Platform.OS !== "web") Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-
-    if (trimmed.toUpperCase() === "CLEAR") {
-      setConsoleLog([{ id: uid(), timestamp: nowTime(), role: "system", text: "Console cleared." }]);
-      return;
-    }
-    if (trimmed.toUpperCase() === "SATS") {
-      appendConsole("system",
-        `**${satCount} satellites** tracked across ${SATELLITE_GROUPS.length} groups.\n` +
-        `Last TLE refresh: ${lastTleRefresh ? lastTleRefresh.toISOString().slice(0, 19) + "Z" : "pending"}\n` +
-        `Groups: ${SATELLITE_GROUPS.map(g => g.label).join(", ")}`
-      );
-      return;
-    }
-
-    appendConsole("user", trimmed);
-    setIsProcessing(true);
-    appendConsole("system", "Processing...");
-
-    try {
-      const res = await fetch(REASON_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: trimmed }),
-        signal: AbortSignal.timeout(30000),
-      });
-      setConsoleLog(prev => prev.filter(e => e.text !== "Processing..."));
-      if (res.ok) {
-        const data = await res.json();
-        const output = data.response ?? data.output ?? data.result ?? JSON.stringify(data, null, 2);
-        appendConsole("response", output);
-      } else {
-        appendConsole("alert", `HTTP ${res.status} — ${res.statusText}`);
-      }
-    } catch (err: unknown) {
-      setConsoleLog(prev => prev.filter(e => e.text !== "Processing..."));
-      const msg = err instanceof Error ? err.message : "Unknown error";
-      appendConsole("alert", `CONNECTION FAILED — ${msg}\n\nEnsure Tailscale is active and JUDITH node is reachable:\n${REASON_URL}`);
-    } finally {
-      setIsProcessing(false);
-    }
-  }, [command, isProcessing, appendConsole, satCount, lastTleRefresh]);
-
-  // ── Urgent Control Handler ────────────────────────────────────────────────────
-  const handleUrgentControl = useCallback((ctrl: typeof URGENT_CONTROLS[number]) => {
-    if (Platform.OS !== "web") Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-    appendConsole("control", `URGENT: ${ctrl.command}`);
-    sendCommand(ctrl.command);
-  }, [appendConsole, sendCommand]);
-
-  // ── Danger Acknowledge ────────────────────────────────────────────────────────
-  const acknowledgeDanger = useCallback(() => {
-    if (dangerEvent) {
-      acknowledgedIds.add(dangerEvent.id);
-      appendConsole("alert",
-        `ACKNOWLEDGED: ${dangerEvent.type} — ${dangerEvent.satName} (NORAD #${dangerEvent.noradId})\n` +
-        `Position: ${dangerEvent.coordinates} · Alt: ${dangerEvent.altKm.toFixed(0)}km\n` +
-        `Threat: ${dangerEvent.threatPct}% · ${dangerEvent.detail}`
-      );
-    }
-    setDangerEvent(null);
-  }, [dangerEvent, acknowledgedIds, appendConsole]);
-
-  // ── Derived ───────────────────────────────────────────────────────────────────
-  const statusColor = useMemo(() =>
-    nodeStatus === "ONLINE" ? C.volt : nodeStatus === "OFFLINE" ? C.red : C.orange,
-    [nodeStatus]
-  );
-
-  const headerFlashBg = headerFlashAnim.interpolate({
-    inputRange: [0, 1], outputRange: ["#050505", "#0D1A00"],
-  });
-
-  const renderTelemetryItem = useCallback(
-    ({ item }: { item: TelemetryEvent }) => <TelemetryRow item={item} />,
-    []
-  );
-  const keyExtractor = useCallback((item: TelemetryEvent) => item.id, []);
+  }, [strobe]);
 
   return (
-    <View style={styles.root}>
-      <StatusBar barStyle="light-content" backgroundColor={C.black} />
-      <ScanLines />
+    <View style={styles.dangerOverlay}>
+      <Animated.View style={[StyleSheet.absoluteFill, { backgroundColor: color, opacity: strobe }]} />
+      <View style={styles.dangerCard}>
+        {/* Header */}
+        <View style={styles.dangerHeader}>
+          <Text style={[styles.dangerTitle, { color }]}>⚠ {event.type} DETECTED</Text>
+          <Text style={styles.dangerTime}>{event.timestamp}</Text>
+        </View>
 
-      <SafeAreaView style={styles.safeArea} edges={["top", "left", "right"]}>
-        <KeyboardAvoidingView
-          style={styles.flex}
-          behavior={Platform.OS === "ios" ? "padding" : "height"}
-          keyboardVerticalOffset={0}
-        >
-          {/* ── NODE STATUS HEADER ───────────────────────────────────────── */}
-          <Animated.View style={[styles.header, { backgroundColor: headerFlashBg }]}>
-            <View style={styles.headerAccentLine} />
-            <View style={styles.headerInner}>
-              <View style={styles.headerRow}>
-                <Text style={styles.appTitle}>GAUSS // MISSION HUD</Text>
-                <View style={[styles.statusBadge, { borderColor: statusColor }]}>
-                  <BlinkDot color={statusColor} />
-                  <Text style={[styles.statusText, { color: statusColor }]}>{nodeStatus}</Text>
-                </View>
-              </View>
-              <View style={styles.headerRow}>
-                <Text style={styles.nodeName}>JUDITH · M1 NODE</Text>
-                <View style={styles.headerMeta}>
-                  {latencyMs !== null && (
-                    <Text style={styles.latency}>{latencyMs}ms</Text>
-                  )}
-                  <Text style={styles.lastChecked}>#{pingCount} · {lastChecked}</Text>
-                </View>
-              </View>
-              {/* TLE data status bar */}
-              <View style={styles.tleStatusRow}>
-                {tleLoading ? (
-                  <View style={styles.tleLoadingRow}>
-                    <ActivityIndicator size="small" color={C.volt} style={{ transform: [{ scale: 0.6 }] }} />
-                    <Text style={styles.tleStatusText}>FETCHING TLE DATA FROM CELESTRAK...</Text>
-                  </View>
-                ) : tleError ? (
-                  <Text style={[styles.tleStatusText, { color: C.red }]}>⚠ {tleError}</Text>
-                ) : (
-                  <Text style={styles.tleStatusText}>
-                    ✓ {satCount} SATS · CELESTRAK · {lastTleRefresh?.toISOString().slice(11, 19)}Z
-                  </Text>
-                )}
-              </View>
-            </View>
-            <View style={styles.divider} />
-          </Animated.View>
+        {/* Satellite info */}
+        <View style={styles.dangerSatRow}>
+          <Text style={styles.dangerSatLabel}>OBJECT</Text>
+          <Text style={[styles.dangerSatValue, { color }]}>{event.satName}</Text>
+        </View>
+        <View style={styles.dangerSatRow}>
+          <Text style={styles.dangerSatLabel}>COORDS</Text>
+          <Text style={styles.dangerSatValue}>{event.coordinates}</Text>
+        </View>
+        <View style={styles.dangerSatRow}>
+          <Text style={styles.dangerSatLabel}>DETAIL</Text>
+          <Text style={styles.dangerSatValue} numberOfLines={2}>{event.detail}</Text>
+        </View>
 
-          {/* ── ORBITAL TELEMETRY FEED ───────────────────────────────────── */}
-          <View style={styles.section}>
-            <View style={styles.sectionHeader}>
-              <Text style={styles.sectionLabel}>ORBITAL TELEMETRY · LIVE</Text>
-              <Text style={styles.sectionMeta}>{telemetry.length} EVENTS</Text>
-            </View>
-            <View style={styles.telemetryContainer}>
-              <View style={styles.telemetryColHeaders}>
-                <Text style={[styles.colHdr, { width: 58 }]}>TIME</Text>
-                <Text style={[styles.colHdr, { width: 68 }]}>TYPE</Text>
-                <Text style={[styles.colHdr, { width: 82 }]}>SATELLITE</Text>
-                <Text style={[styles.colHdr, { flex: 1 }]}>DETAIL / THREAT</Text>
-              </View>
-              {tleLoading && telemetry.length === 0 ? (
-                <View style={styles.telemetryLoading}>
-                  <ActivityIndicator color={C.volt} />
-                  <Text style={styles.telemetryLoadingText}>ACQUIRING ORBITAL DATA...</Text>
-                </View>
-              ) : (
-                <FlatList
-                  data={telemetry}
-                  keyExtractor={keyExtractor}
-                  renderItem={renderTelemetryItem}
-                  style={styles.telemetryList}
-                  showsVerticalScrollIndicator={false}
-                  initialNumToRender={10}
-                  maxToRenderPerBatch={5}
-                  removeClippedSubviews
-                />
-              )}
-            </View>
+        {/* Threat probability bar */}
+        <View style={styles.dangerThreatWrap}>
+          <Text style={styles.dangerThreatLabel}>THREAT PROBABILITY</Text>
+          <View style={styles.dangerThreatTrack}>
+            <View style={[styles.dangerThreatFill, { width: `${event.threatPct}%` as any, backgroundColor: color }]} />
           </View>
+          <Text style={[styles.dangerThreatPct, { color }]}>{event.threatPct}%</Text>
+        </View>
 
-          {/* ── ACTIONING CONSOLE ────────────────────────────────────────── */}
-          <View style={[styles.section, styles.consoleFlex]}>
-            <View style={styles.sectionHeader}>
-              <Text style={styles.sectionLabel}>ACTIONING CONSOLE</Text>
-              {isProcessing && (
-                <View style={styles.processingRow}>
-                  <Text style={styles.processingDots}>···</Text>
-                  <Text style={styles.processingLabel}>PROCESSING</Text>
-                </View>
-              )}
-            </View>
-            <View style={styles.consoleContainer}>
-              <ScrollView
-                ref={consoleScrollRef}
-                style={styles.consoleScroll}
-                showsVerticalScrollIndicator={false}
-                contentContainerStyle={styles.consoleContent}
-              >
-                {consoleLog.map(entry => (
-                  <ConsoleEntryRow key={entry.id} entry={entry} />
-                ))}
-                {!isProcessing && <BlinkingCursor />}
-              </ScrollView>
-            </View>
-          </View>
-
-          {/* ── URGENT CONTROLS ──────────────────────────────────────────── */}
-          <View style={styles.urgentBar}>
-            <Text style={styles.urgentLabel}>URGENT</Text>
-            {URGENT_CONTROLS.map(ctrl => (
-              <Pressable
-                key={ctrl.id}
-                style={({ pressed }) => [
-                  styles.urgentBtn,
-                  { borderColor: ctrl.color, backgroundColor: pressed ? ctrl.color + "44" : ctrl.bg },
-                ]}
-                onPress={() => handleUrgentControl(ctrl)}
-              >
-                <Text style={[styles.urgentBtnText, { color: ctrl.color }]}>{ctrl.label}</Text>
-              </Pressable>
-            ))}
-          </View>
-
-          {/* ── COMMAND INPUT ─────────────────────────────────────────────── */}
-          <View style={[styles.commandBar, { paddingBottom: Math.max(insets.bottom, 10) }]}>
-            <View style={styles.commandInputWrapper}>
-              <Text style={styles.commandPrompt}>{">"}</Text>
-              <TextInput
-                ref={inputRef}
-                style={styles.commandInput}
-                value={command}
-                onChangeText={setCommand}
-                placeholder="ENTER COMMAND... (try: SATS)"
-                placeholderTextColor={C.dim}
-                onSubmitEditing={() => sendCommand()}
-                returnKeyType="send"
-                editable={!isProcessing}
-                autoCapitalize="characters"
-                autoCorrect={false}
-                selectionColor={C.volt}
-              />
-            </View>
+        {/* Urgent action buttons */}
+        <View style={styles.urgentRow}>
+          {URGENT_CONTROLS.map(ctrl => (
             <Pressable
+              key={ctrl.action}
+              onPress={() => onUrgentAction(ctrl.action)}
               style={({ pressed }) => [
-                styles.sendBtn,
-                (isProcessing || !command.trim()) && styles.sendBtnDisabled,
-                pressed && !isProcessing && command.trim() && styles.sendBtnPressed,
+                styles.urgentBtn,
+                { borderColor: ctrl.color, backgroundColor: pressed ? ctrl.color + "22" : "transparent" },
               ]}
-              onPress={() => sendCommand()}
-              disabled={isProcessing || !command.trim()}
             >
-              <Text style={[
-                styles.sendBtnText,
-                (isProcessing || !command.trim()) && styles.sendBtnTextDisabled,
-              ]}>
-                {isProcessing ? "WAIT" : "SEND"}
-              </Text>
+              <Text style={[styles.urgentBtnText, { color: ctrl.color }]}>{ctrl.label}</Text>
             </Pressable>
-          </View>
-        </KeyboardAvoidingView>
-      </SafeAreaView>
+          ))}
+        </View>
 
-      {/* ── DANGER FLASH OVERLAY ─────────────────────────────────────────── */}
-      {dangerEvent && (
-        <DangerFlash event={dangerEvent} onAcknowledge={acknowledgeDanger} />
-      )}
+        {/* Acknowledge */}
+        <Pressable
+          onPress={onAcknowledge}
+          style={({ pressed }) => [
+            styles.ackBtn,
+            { backgroundColor: pressed ? C.VOLT + "33" : "transparent" },
+          ]}
+        >
+          <Text style={styles.ackBtnText}>ACKNOWLEDGE</Text>
+        </Pressable>
+      </View>
     </View>
   );
 }
 
+// ─── Urgent Controls Config ───────────────────────────────────────────────────
+const URGENT_CONTROLS = [
+  { label: "ABORT",    action: "ABORT",    color: C.RED    },
+  { label: "ISOLATE",  action: "ISOLATE",  color: C.ORANGE },
+  { label: "OVERRIDE", action: "OVERRIDE", color: C.AMBER  },
+  { label: "LOCKDOWN", action: "LOCKDOWN", color: C.WHITE  },
+];
+
+// ─── Main HUD Screen ──────────────────────────────────────────────────────────
+export default function HUDScreen() {
+  // ── State ──────────────────────────────────────────────────────────────────
+  const [nodeStatus, setNodeStatus]     = useState<NodeStatus>("CONNECTING");
+  const [pingMs, setPingMs]             = useState<number | null>(null);
+  const [pingCount, setPingCount]       = useState(0);
+  const [lastPingTime, setLastPingTime] = useState("");
+  const [dataSource, setDataSource]     = useState("");
+
+  const [allGP, setAllGP]               = useState<CelesTrakGP[]>([]);
+  const [events, setEvents]             = useState<TelemetryEvent[]>([]);
+  const [newEventIds, setNewEventIds]   = useState<Set<string>>(new Set());
+  const [isFetchingTLE, setIsFetchingTLE] = useState(false);
+  const [lastTLEFetch, setLastTLEFetch] = useState<Date | null>(null);
+
+  const [consoleLog, setConsoleLog]     = useState<ConsoleEntry[]>([]);
+  const [command, setCommand]           = useState("");
+  const [isReasoning, setIsReasoning]   = useState(false);
+
+  const [dangerEvent, setDangerEvent]   = useState<TelemetryEvent | null>(null);
+  const [seenDangerIds, setSeenDangerIds] = useState<Set<string>>(new Set());
+
+  // Contextual UI: collapse non-essential panels on CRISIS
+  const [threatLevel, setThreatLevel]   = useState<"NOMINAL" | "WARNING" | "CRISIS">("NOMINAL");
+  const [showOrbitalArc, setShowOrbitalArc] = useState(true);
+
+  const consoleRef  = useRef<ScrollView>(null);
+  const inputRef    = useRef<TextInput>(null);
+
+  // ── Console logger ─────────────────────────────────────────────────────────
+  const log = useCallback((text: string, color?: string, isBold?: boolean) => {
+    setConsoleLog(prev => [
+      ...prev.slice(-99),
+      { id: genId(), time: nowTime(), text, color, isBold },
+    ]);
+    setTimeout(() => consoleRef.current?.scrollToEnd({ animated: true }), 80);
+  }, []);
+
+  // ── Health check loop ──────────────────────────────────────────────────────
+  const doHealthCheck = useCallback(async () => {
+    const t0 = Date.now();
+    try {
+      const res = await fetch(HEALTH_URL, { signal: AbortSignal.timeout(5000) });
+      const ms = Date.now() - t0;
+      setPingMs(ms);
+      setPingCount(c => c + 1);
+      setLastPingTime(nowTime());
+      if (res.ok) {
+        setNodeStatus("ONLINE");
+        // Haptic: light for successful data fetch
+        if (Platform.OS !== "web") {
+          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+        }
+      } else {
+        setNodeStatus("OFFLINE");
+      }
+    } catch {
+      setNodeStatus("OFFLINE");
+      setPingMs(null);
+      setPingCount(c => c + 1);
+      setLastPingTime(nowTime());
+    }
+  }, []);
+
+  // ── Fetch TLE data ─────────────────────────────────────────────────────────
+  const fetchTLEData = useCallback(async () => {
+    if (isFetchingTLE) return;
+    setIsFetchingTLE(true);
+    log("Fetching live TLE data from CelesTrak...", C.MUTED);
+    try {
+      const gp = await fetchAllSatellites();
+      setAllGP(gp);
+      setLastTLEFetch(new Date());
+      const src = `CelesTrak (celestrak.org) · Dr. T.S. Kelso`;
+      setDataSource(src);
+      log(
+        `TLE data loaded: **${gp.length} satellites** across 7/7 groups.\nSource: ${src}\nPropagation: SGP4/SDP4 via satellite.js v6`,
+        C.VOLT,
+        true,
+      );
+    } catch (err) {
+      log(`TLE fetch error: ${err}`, C.RED);
+    } finally {
+      setIsFetchingTLE(false);
+    }
+  }, [isFetchingTLE, log]);
+
+  // ── Propagate satellites → telemetry events ────────────────────────────────
+  const propagateAll = useCallback(async () => {
+    if (allGP.length === 0) return;
+
+    // Load operator events and merge
+    const opEvents = await loadRiskEvents();
+    const opTelemetry = opEvents
+      .filter(e => !e.isAcknowledged)
+      .slice(0, 20)
+      .map(operatorEventToTelemetry);
+
+    const now = new Date();
+    const computed: TelemetryEvent[] = allGP
+      .slice(0, 80)
+      .map(gp => {
+        const state = propagateGP(gp, now);
+        const { type, detail, threatPct } = classifyEvent(state);
+        return {
+          id: `${gp.NORAD_CAT_ID}-${now.getTime()}`,
+          timestamp: now.toISOString().slice(11, 19),
+          type,
+          satName: formatSatName(gp.OBJECT_NAME),
+          noradId: gp.NORAD_CAT_ID,
+          coordinates: formatCoords(state.lat, state.lon),
+          detail,
+          threatPct,
+          altKm: state.altKm,
+          velKms: state.velKms,
+          isReal: true as const,
+        };
+      })
+      .sort((a, b) => b.threatPct - a.threatPct);
+
+    const merged = [...opTelemetry, ...computed].slice(0, 50);
+
+    // Find new IDs
+    setEvents(prev => {
+      const prevIds = new Set(prev.map(e => e.id));
+      const newIds = new Set(merged.filter(e => !prevIds.has(e.id)).map(e => e.id));
+      setNewEventIds(newIds);
+      setTimeout(() => setNewEventIds(new Set()), 1000);
+      return merged;
+    });
+
+    // Update threat level for contextual UI
+    const maxThreat = Math.max(...merged.map(e => e.threatPct), 0);
+    const newThreatLevel =
+      maxThreat >= DANGER_THRESHOLD ? "CRISIS" :
+      maxThreat >= 40               ? "WARNING" : "NOMINAL";
+    setThreatLevel(newThreatLevel);
+
+    // Contextual generative UI: collapse orbital arc on CRISIS to expand telemetry
+    setShowOrbitalArc(newThreatLevel !== "CRISIS");
+
+    // Danger flash check
+    const danger = merged.find(
+      e => e.threatPct >= DANGER_THRESHOLD && !seenDangerIds.has(e.id)
+    );
+    if (danger) {
+      setDangerEvent(danger);
+      setSeenDangerIds(prev => new Set([...prev, danger.id]));
+      // Haptic: heavy impact for danger event (distinct from data fetch)
+      if (Platform.OS !== "web") {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      }
+    }
+  }, [allGP, seenDangerIds]);
+
+  // ── Initialise ─────────────────────────────────────────────────────────────
+  useEffect(() => {
+    log("GAUSS MISSION HUD ONLINE. JUDITH M1 NODE INITIALIZING...", C.VOLT, true);
+    doHealthCheck();
+    fetchTLEData();
+
+    const healthInterval = setInterval(doHealthCheck, 10_000);
+    const propInterval   = setInterval(propagateAll, 5_000);
+    // TLE refresh every 6 hours
+    const tleInterval    = setInterval(fetchTLEData, 6 * 3600 * 1000);
+
+    return () => {
+      clearInterval(healthInterval);
+      clearInterval(propInterval);
+      clearInterval(tleInterval);
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Re-run propagation when GP data arrives
+  useEffect(() => {
+    if (allGP.length > 0) propagateAll();
+  }, [allGP]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Send command ───────────────────────────────────────────────────────────
+  const sendCommand = useCallback(async (cmd?: string) => {
+    const text = (cmd ?? command).trim().toUpperCase();
+    if (!text) return;
+
+    setCommand("");
+    log(`> ${text}`, C.VOLT);
+
+    // Haptic: medium impact for command send (distinct from data fetch)
+    if (Platform.OS !== "web") {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    }
+
+    // Built-in commands
+    if (text === "CLEAR") {
+      setConsoleLog([]);
+      return;
+    }
+    if (text === "SATS") {
+      const critCount = events.filter(e => e.type === "CRITICAL").length;
+      const anomCount = events.filter(e => e.type === "ANOMALY").length;
+      log(
+        `ORBITAL INVENTORY\n` +
+        `Total tracked: ${allGP.length} satellites\n` +
+        `Source: ${dataSource}\n` +
+        `Last TLE fetch: ${lastTLEFetch?.toISOString().slice(11, 19) ?? "N/A"}\n` +
+        `CRITICAL events: ${critCount}\n` +
+        `ANOMALY events: ${anomCount}\n` +
+        `Threat level: ${threatLevel}`,
+        C.VOLT,
+      );
+      return;
+    }
+    if (text === "STATUS") {
+      log(
+        `NODE STATUS: ${nodeStatus}\n` +
+        `Latency: ${pingMs != null ? `${pingMs}ms` : "N/A"}\n` +
+        `Ping count: ${pingCount}\n` +
+        `Last ping: ${lastPingTime}`,
+        nodeStatus === "ONLINE" ? C.VOLT : C.RED,
+      );
+      return;
+    }
+
+    // Forward to M1 node
+    setIsReasoning(true);
+    try {
+      const res = await fetch(REASON_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: text }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const output = data.response ?? data.result ?? data.output ?? JSON.stringify(data);
+      log(output, C.WHITE);
+      // Haptic: success notification for M1 response
+      if (Platform.OS !== "web") {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      }
+    } catch (err: any) {
+      log(`M1 NODE UNREACHABLE: ${err?.message ?? err}\nEnsure Tailscale is active and JUDITH is online.`, C.RED);
+      // Haptic: error notification
+      if (Platform.OS !== "web") {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      }
+    } finally {
+      setIsReasoning(false);
+    }
+  }, [command, events, allGP, dataSource, lastTLEFetch, threatLevel, nodeStatus, pingMs, pingCount, lastPingTime, log]);
+
+  // ── Urgent control handler ─────────────────────────────────────────────────
+  const handleUrgentAction = useCallback((action: string) => {
+    // Haptic: heavy impact for urgent commands (maximum physicality)
+    if (Platform.OS !== "web") {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    }
+    const ctrl = URGENT_CONTROLS.find(c => c.action === action);
+    log(`>> URGENT: ${action} COMMAND DISPATCHED`, ctrl?.color ?? C.RED, true);
+    sendCommand(`URGENT ${action}`);
+  }, [log, sendCommand]);
+
+  // ── Acknowledge danger flash ───────────────────────────────────────────────
+  const handleAcknowledge = useCallback(() => {
+    if (!dangerEvent) return;
+    if (Platform.OS !== "web") {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    }
+    log(`ACKNOWLEDGED: ${dangerEvent.type} on ${dangerEvent.satName}`, C.AMBER);
+    setDangerEvent(null);
+  }, [dangerEvent, log]);
+
+  // ── Derived values ─────────────────────────────────────────────────────────
+  const statusColor =
+    nodeStatus === "ONLINE"     ? C.VOLT  :
+    nodeStatus === "CONNECTING" ? C.AMBER : C.RED;
+
+  const threatAccent =
+    threatLevel === "CRISIS"  ? C.RED   :
+    threatLevel === "WARNING" ? C.AMBER : C.VOLT;
+
+  const criticalCount = events.filter(e => e.type === "CRITICAL").length;
+  const anomalyCount  = events.filter(e => e.type === "ANOMALY").length;
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+  return (
+    <SafeAreaView style={styles.root} edges={["top", "left", "right"]}>
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        keyboardVerticalOffset={0}
+      >
+        {/* ── TOP ACCENT LINE (threat-level color cascade) ── */}
+        <View style={[styles.topAccent, { backgroundColor: threatAccent }]} />
+
+        {/* ── NODE STATUS HEADER (250ms glanceability) ── */}
+        <View style={styles.header}>
+          <View style={styles.headerLeft}>
+            <Text style={styles.headerTitle}>GAUSS // MISSION HUD</Text>
+            <Text style={styles.headerSub}>JUDITH · M1 NODE</Text>
+          </View>
+          <View style={styles.headerRight}>
+            <StatusGlow status={nodeStatus} />
+            <View style={styles.headerStatusBlock}>
+              <View style={[styles.statusBadge, { borderColor: statusColor }]}>
+                <Text style={[styles.statusText, { color: statusColor }]}>{nodeStatus}</Text>
+              </View>
+              <Text style={styles.headerMeta}>
+                #{pingCount} · {lastPingTime || nowTime()}
+              </Text>
+              {pingMs != null && (
+                <Text style={[styles.headerMeta, { color: statusColor }]}>{pingMs}ms</Text>
+              )}
+            </View>
+          </View>
+        </View>
+
+        {/* ── DATA SOURCE STRIP ── */}
+        {dataSource ? (
+          <View style={styles.dataSourceStrip}>
+            <Text style={styles.dataSourceText}>
+              ✓ {allGP.length} SATS · CELESTRAK · {lastTLEFetch?.toISOString().slice(11, 19) ?? ""}Z
+            </Text>
+            {criticalCount > 0 && (
+              <Text style={[styles.dataSourceText, { color: C.RED }]}>
+                {criticalCount} CRITICAL
+              </Text>
+            )}
+            {anomalyCount > 0 && (
+              <Text style={[styles.dataSourceText, { color: C.ORANGE }]}>
+                {anomalyCount} ANOMALY
+              </Text>
+            )}
+          </View>
+        ) : (
+          <View style={styles.dataSourceStrip}>
+            <Text style={[styles.dataSourceText, { color: C.AMBER }]}>
+              {isFetchingTLE ? "FETCHING TLE DATA FROM CELESTRAK..." : "NO DATA"}
+            </Text>
+          </View>
+        )}
+
+        {/* ── BENTO BOX LAYOUT ── */}
+        <View style={styles.bentoGrid}>
+
+          {/* ── ORBITAL ARC VISUALISER (collapses on CRISIS) ── */}
+          {showOrbitalArc && (
+            <BentoCard
+              label="ORBITAL TELEMETRY · LIVE"
+              labelRight={`${events.length} EVENTS`}
+              accentColor={threatAccent}
+            >
+              <OrbitalArcVisualiser events={events} threatLevel={threatLevel} />
+            </BentoCard>
+          )}
+
+          {/* ── TELEMETRY FEED ── */}
+          <BentoCard
+            label={showOrbitalArc ? "FEED" : "ORBITAL TELEMETRY · LIVE — TRAJECTORY HUD EXPANDED"}
+            labelRight={!showOrbitalArc ? `${events.length} EVENTS` : undefined}
+            accentColor={threatAccent}
+            noPad
+            flex={showOrbitalArc ? undefined : 2}
+          >
+            {events.length === 0 ? (
+              <View style={styles.emptyFeed}>
+                <Text style={styles.emptyFeedText}>
+                  {isFetchingTLE ? "ACQUIRING ORBITAL DATA..." : "NO EVENTS"}
+                </Text>
+              </View>
+            ) : (
+              <FlatList
+                data={events}
+                keyExtractor={item => item.id}
+                renderItem={({ item }) => (
+                  <TelemetryRow item={item} isNew={newEventIds.has(item.id)} />
+                )}
+                style={styles.feedList}
+                showsVerticalScrollIndicator={false}
+                ListHeaderComponent={
+                  <View style={styles.feedHeader}>
+                    <Text style={styles.feedHeaderCell}>TIME</Text>
+                    <Text style={styles.feedHeaderCell}>TYPE</Text>
+                    <Text style={styles.feedHeaderCell}>SATELLITE</Text>
+                    <Text style={[styles.feedHeaderCell, { flex: 2 }]}>DETAIL / THREAT</Text>
+                  </View>
+                }
+              />
+            )}
+          </BentoCard>
+
+          {/* ── ACTIONING CONSOLE ── */}
+          <BentoCard
+            label="ACTIONING CONSOLE"
+            accentColor={isReasoning ? C.AMBER : C.VOLT}
+            flex={1}
+          >
+            <ScrollView
+              ref={consoleRef}
+              style={styles.console}
+              showsVerticalScrollIndicator={false}
+              onContentSizeChange={() => consoleRef.current?.scrollToEnd({ animated: true })}
+            >
+              {consoleLog.length === 0 ? (
+                <Text style={styles.consoleIdle}>AWAITING COMMAND...</Text>
+              ) : (
+                consoleLog.map(entry => (
+                  <View key={entry.id} style={styles.consoleEntry}>
+                    <Text style={styles.consoleTime}>[{entry.time}]</Text>
+                    <Text
+                      style={[
+                        styles.consoleText,
+                        entry.color ? { color: entry.color } : undefined,
+                        entry.isBold ? { fontFamily: FONT.bold } : undefined,
+                      ]}
+                    >
+                      {entry.text}
+                    </Text>
+                  </View>
+                ))
+              )}
+              {isReasoning && (
+                <View style={styles.consoleEntry}>
+                  <Text style={styles.consoleTime}>[{nowTime()}]</Text>
+                  <Text style={[styles.consoleText, { color: C.AMBER }]}>
+                    M1 REASONING...
+                  </Text>
+                </View>
+              )}
+            </ScrollView>
+          </BentoCard>
+
+        </View>
+
+        {/* ── URGENT CONTROLS ── */}
+        <View style={[styles.urgentBar, { borderTopColor: threatAccent }]}>
+          <Text style={[styles.urgentLabel, { color: threatAccent }]}>URGENT</Text>
+          {URGENT_CONTROLS.map(ctrl => (
+            <Pressable
+              key={ctrl.action}
+              onPress={() => handleUrgentAction(ctrl.action)}
+              style={({ pressed }) => [
+                styles.urgentBtn,
+                {
+                  borderColor: ctrl.color,
+                  backgroundColor: pressed ? ctrl.color + "22" : "transparent",
+                  transform: [{ scale: pressed ? 0.97 : 1 }],
+                },
+              ]}
+            >
+              <Text style={[styles.urgentBtnText, { color: ctrl.color }]}>{ctrl.label}</Text>
+            </Pressable>
+          ))}
+        </View>
+
+        {/* ── COMMAND INPUT ── */}
+        <View style={[styles.commandBar, { borderTopColor: C.BORDER2 }]}>
+          <Text style={styles.commandPrompt}>&gt;</Text>
+          <TextInput
+            ref={inputRef}
+            style={styles.commandInput}
+            value={command}
+            onChangeText={setCommand}
+            placeholder="ENTER COMMAND... (try: SATS)"
+            placeholderTextColor={C.MUTED2}
+            autoCapitalize="characters"
+            autoCorrect={false}
+            returnKeyType="send"
+            onSubmitEditing={() => sendCommand()}
+            editable={!isReasoning}
+          />
+          <Pressable
+            onPress={() => sendCommand()}
+            disabled={isReasoning || !command.trim()}
+            style={({ pressed }) => [
+              styles.sendBtn,
+              {
+                backgroundColor:
+                  isReasoning || !command.trim() ? C.MUTED2 : C.VOLT,
+                transform: [{ scale: pressed ? 0.96 : 1 }],
+              },
+            ]}
+          >
+            <Text style={[styles.sendBtnText, { color: C.BLACK }]}>
+              {isReasoning ? "..." : "SEND"}
+            </Text>
+          </Pressable>
+        </View>
+
+      </KeyboardAvoidingView>
+
+      {/* ── DANGER FLASH OVERLAY ── */}
+      {dangerEvent && (
+        <DangerFlashOverlay
+          event={dangerEvent}
+          onAcknowledge={handleAcknowledge}
+          onUrgentAction={(action) => {
+            handleUrgentAction(action);
+            handleAcknowledge();
+          }}
+        />
+      )}
+    </SafeAreaView>
+  );
+}
+
 // ─── Styles ───────────────────────────────────────────────────────────────────
-const MONO = Platform.OS === "ios" ? "Courier New" : "monospace";
-
 const styles = StyleSheet.create({
-  root:    { flex: 1, backgroundColor: C.black },
-  safeArea:{ flex: 1, backgroundColor: C.black },
-  flex:    { flex: 1 },
-
-  scanLine: {
-    position: "absolute", left: 0, right: 0, height: 1,
-    backgroundColor: "rgba(0,0,0,0.18)",
+  root: {
+    flex: 1,
+    backgroundColor: C.BLACK,
+  },
+  topAccent: {
+    height: 2,
+    width: "100%",
   },
 
-  // Header
-  header:          { backgroundColor: C.black },
-  headerAccentLine:{ height: 2, backgroundColor: C.volt },
-  headerInner:     { paddingHorizontal: 14, paddingTop: 8, paddingBottom: 6 },
-  headerRow:       { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 3 },
-  appTitle:        { fontFamily: MONO, fontSize: 14, fontWeight: "700", color: C.volt, letterSpacing: 2.5 },
-  statusBadge:     { flexDirection: "row", alignItems: "center", borderWidth: 1, paddingHorizontal: 7, paddingVertical: 3, gap: 5 },
-  statusDot:       { width: 6, height: 6 },
-  statusText:      { fontFamily: MONO, fontSize: 10, fontWeight: "700", letterSpacing: 1.5 },
-  nodeName:        { fontFamily: MONO, fontSize: 11, color: C.white, letterSpacing: 1.5, fontWeight: "600" },
-  headerMeta:      { flexDirection: "row", alignItems: "center", gap: 8 },
-  latency:         { fontFamily: MONO, fontSize: 10, color: C.volt, letterSpacing: 1 },
-  lastChecked:     { fontFamily: MONO, fontSize: 10, color: C.dim, letterSpacing: 0.5 },
-  tleStatusRow:    { marginTop: 3 },
-  tleLoadingRow:   { flexDirection: "row", alignItems: "center", gap: 6 },
-  tleStatusText:   { fontFamily: MONO, fontSize: 9, color: C.dim, letterSpacing: 0.8 },
-  divider:         { height: 1, backgroundColor: C.border },
+  // ── Header ─────────────────────────────────────────────────────────────────
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: C.BORDER,
+  },
+  headerLeft: {
+    flex: 1,
+  },
+  headerTitle: {
+    fontFamily: FONT.bold,
+    fontSize: 13,
+    color: C.VOLT,
+    letterSpacing: 1.5,
+  },
+  headerSub: {
+    fontFamily: FONT.regular,
+    fontSize: 9,
+    color: C.MUTED,
+    letterSpacing: 1,
+    marginTop: 1,
+  },
+  headerRight: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  headerStatusBlock: {
+    alignItems: "flex-end",
+    gap: 2,
+  },
+  statusBadge: {
+    borderWidth: 1,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+  },
+  statusText: {
+    fontFamily: FONT.bold,
+    fontSize: 9,
+    letterSpacing: 1.5,
+  },
+  headerMeta: {
+    fontFamily: FONT.regular,
+    fontSize: 8,
+    color: C.MUTED,
+    letterSpacing: 0.5,
+  },
 
-  // Sections
-  section:       { paddingHorizontal: 12, paddingTop: 8 },
-  consoleFlex:   { flex: 1 },
-  sectionHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 5 },
-  sectionLabel:  { fontFamily: MONO, fontSize: 8, color: C.dim, letterSpacing: 3, fontWeight: "700" },
-  sectionMeta:   { fontFamily: MONO, fontSize: 8, color: C.dim, letterSpacing: 1 },
+  // ── Status glow ────────────────────────────────────────────────────────────
+  statusGlowWrap: {
+    width: 16,
+    height: 16,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  statusGlowRing: {
+    position: "absolute",
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    borderWidth: 1.5,
+  },
+  statusDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 3.5,
+  },
 
-  // Telemetry
-  telemetryContainer:  { backgroundColor: C.surface, borderWidth: 1, borderColor: C.border, height: 200 },
-  telemetryColHeaders: { flexDirection: "row", paddingHorizontal: 8, paddingVertical: 4, borderBottomWidth: 1, borderBottomColor: C.border, backgroundColor: C.black },
-  colHdr:              { fontFamily: MONO, fontSize: 8, color: C.dim, letterSpacing: 1.5, fontWeight: "700" },
-  telemetryList:       { flex: 1 },
-  telemetryLoading:    { flex: 1, justifyContent: "center", alignItems: "center", gap: 8 },
-  telemetryLoadingText:{ fontFamily: MONO, fontSize: 10, color: C.dim, letterSpacing: 2 },
-  telemetryRow:        { flexDirection: "row", paddingHorizontal: 8, paddingVertical: 4, borderBottomWidth: 1, borderBottomColor: "#0F0F0F", alignItems: "center", position: "relative" },
-  telemetryRowDanger:  { backgroundColor: "#1A0000" },
-  telemetryDangerBorder:{ position: "absolute", left: 0, top: 0, bottom: 0, width: 2, backgroundColor: C.red },
-  telemetryTime:       { fontFamily: MONO, fontSize: 10, color: C.dim,   width: 58, letterSpacing: 0.3 },
-  telemetryType:       { fontFamily: MONO, fontSize: 10, fontWeight: "700", width: 68, letterSpacing: 0.3 },
-  telemetrySat:        { fontFamily: MONO, fontSize: 10, color: C.white, width: 82, letterSpacing: 0.3 },
-  telemetryRight:      { flex: 1, gap: 2 },
-  telemetryDetail:     { fontFamily: MONO, fontSize: 10, color: C.dim, letterSpacing: 0.2 },
-  threatBarBg:         { height: 2, backgroundColor: C.dim2, overflow: "hidden" },
-  threatBarFill:       { height: 2 },
+  // ── Data source strip ──────────────────────────────────────────────────────
+  dataSourceStrip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    borderBottomWidth: 1,
+    borderBottomColor: C.BORDER,
+    backgroundColor: C.SURFACE,
+  },
+  dataSourceText: {
+    fontFamily: FONT.regular,
+    fontSize: 8,
+    color: C.VOLT,
+    letterSpacing: 0.8,
+  },
 
-  // Console
-  consoleContainer: { flex: 1, backgroundColor: C.surface, borderWidth: 1, borderColor: C.border },
-  consoleScroll:    { flex: 1 },
-  consoleContent:   { padding: 10, paddingBottom: 16 },
-  consoleRow:       { flexDirection: "row", marginBottom: 8, flexWrap: "nowrap" },
-  consolePrefix:    { fontFamily: MONO, fontSize: 10, letterSpacing: 0.3, lineHeight: 16, flexShrink: 0 },
-  consoleBody:      { flex: 1, flexShrink: 1 },
-  cursor:           { width: 8, height: 13, backgroundColor: C.volt, marginTop: 2 },
+  // ── Bento grid ─────────────────────────────────────────────────────────────
+  bentoGrid: {
+    flex: 1,
+    paddingHorizontal: 8,
+    paddingTop: 6,
+    gap: 6,
+  },
+  bentoCard: {
+    backgroundColor: C.SURFACE,
+    borderWidth: 1,
+    borderColor: C.BORDER,
+    overflow: "hidden",
+  },
+  bentoAccent: {
+    height: 2,
+    width: "100%",
+  },
+  bentoHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderBottomWidth: 1,
+    borderBottomColor: C.BORDER,
+  },
+  bentoLabel: {
+    fontFamily: FONT.bold,
+    fontSize: 8,
+    color: C.MUTED,
+    letterSpacing: 1.5,
+  },
+  bentoLabelRight: {
+    fontFamily: FONT.regular,
+    fontSize: 8,
+    color: C.MUTED,
+    letterSpacing: 0.5,
+  },
+  bentoPad: {
+    padding: 8,
+  },
 
-  // Markdown
-  mdParagraph: { fontFamily: MONO, fontSize: 12, color: C.white, lineHeight: 17, letterSpacing: 0.2 },
-  mdH1:        { fontFamily: MONO, fontSize: 12, fontWeight: "700", color: C.volt, letterSpacing: 2, marginTop: 6, marginBottom: 3 },
-  mdH2:        { fontFamily: MONO, fontSize: 11, fontWeight: "700", color: C.volt, letterSpacing: 1.5, marginTop: 4, marginBottom: 2 },
-  mdList:      { fontFamily: MONO, fontSize: 12, color: C.white, lineHeight: 17, paddingLeft: 4 },
-  mdBold:      { fontWeight: "700", color: C.volt },
-  mdCode:      { fontFamily: MONO, fontSize: 11, color: C.volt, backgroundColor: "#0A0A0A" },
-  mdCodeLine:  { fontFamily: MONO, fontSize: 11, color: C.volt, lineHeight: 16, backgroundColor: "#0A0A0A", paddingHorizontal: 4 },
+  // ── Telemetry feed ─────────────────────────────────────────────────────────
+  feedList: {
+    maxHeight: 180,
+  },
+  feedHeader: {
+    flexDirection: "row",
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderBottomWidth: 1,
+    borderBottomColor: C.BORDER,
+    backgroundColor: C.SURFACE2,
+  },
+  feedHeaderCell: {
+    flex: 1,
+    fontFamily: FONT.bold,
+    fontSize: 7,
+    color: C.MUTED,
+    letterSpacing: 1,
+  },
+  emptyFeed: {
+    height: 80,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  emptyFeedText: {
+    fontFamily: FONT.regular,
+    fontSize: 9,
+    color: C.MUTED,
+    letterSpacing: 1,
+  },
 
-  // Processing
-  processingRow:   { flexDirection: "row", alignItems: "center", gap: 5 },
-  processingDots:  { fontFamily: MONO, fontSize: 14, color: C.volt, letterSpacing: 3 },
-  processingLabel: { fontFamily: MONO, fontSize: 8, color: C.volt, letterSpacing: 2 },
+  // ── Telemetry row ──────────────────────────────────────────────────────────
+  telemetryRow: {
+    flexDirection: "row",
+    borderBottomWidth: 1,
+    borderBottomColor: C.BORDER,
+    minHeight: 36,
+  },
+  telemetryRowCritical: {
+    backgroundColor: "#1A0000",
+  },
+  telemetryBar: {
+    width: 2,
+  },
+  telemetryContent: {
+    flex: 1,
+    paddingHorizontal: 6,
+    paddingVertical: 4,
+    gap: 2,
+  },
+  telemetryMeta: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+  },
+  telemetryTime: {
+    fontFamily: FONT.regular,
+    fontSize: 8,
+    color: C.MUTED,
+    width: 36,
+  },
+  typeBadge: {
+    borderWidth: 1,
+    paddingHorizontal: 3,
+    paddingVertical: 1,
+  },
+  typeBadgeText: {
+    fontFamily: FONT.bold,
+    fontSize: 7,
+    letterSpacing: 0.8,
+  },
+  opBadge: {
+    backgroundColor: C.AMBER + "33",
+    borderWidth: 1,
+    borderColor: C.AMBER,
+    paddingHorizontal: 3,
+    paddingVertical: 1,
+  },
+  opBadgeText: {
+    fontFamily: FONT.bold,
+    fontSize: 7,
+    color: C.AMBER,
+    letterSpacing: 0.5,
+  },
+  telemetryBody: {
+    flexDirection: "row",
+    gap: 6,
+    flex: 1,
+  },
+  telemetrySatName: {
+    fontFamily: FONT.medium,
+    fontSize: 9,
+    color: C.WHITE,
+    flex: 1,
+    letterSpacing: 0.5,
+  },
+  telemetryDetail: {
+    fontFamily: FONT.regular,
+    fontSize: 8,
+    color: C.MUTED,
+    flex: 2,
+  },
+  threatBarWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+  },
+  threatBarFill: {
+    height: 2,
+    maxWidth: "80%",
+  },
+  threatPct: {
+    fontFamily: FONT.regular,
+    fontSize: 7,
+    letterSpacing: 0.5,
+  },
 
-  // Urgent Controls
-  urgentBar:     { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 7, borderTopWidth: 1, borderTopColor: C.border, backgroundColor: C.black, gap: 6 },
-  urgentLabel:   { fontFamily: MONO, fontSize: 7, color: C.dim, letterSpacing: 2, fontWeight: "700", marginRight: 2 },
-  urgentBtn:     { flex: 1, borderWidth: 1, paddingVertical: 7, alignItems: "center", justifyContent: "center" },
-  urgentBtnText: { fontFamily: MONO, fontSize: 10, fontWeight: "700", letterSpacing: 1 },
+  // ── Console ────────────────────────────────────────────────────────────────
+  console: {
+    maxHeight: 120,
+  },
+  consoleIdle: {
+    fontFamily: FONT.regular,
+    fontSize: 9,
+    color: C.MUTED,
+    letterSpacing: 1,
+  },
+  consoleEntry: {
+    flexDirection: "row",
+    gap: 6,
+    marginBottom: 4,
+    flexWrap: "wrap",
+  },
+  consoleTime: {
+    fontFamily: FONT.regular,
+    fontSize: 8,
+    color: C.MUTED,
+    flexShrink: 0,
+  },
+  consoleText: {
+    fontFamily: FONT.regular,
+    fontSize: 9,
+    color: C.WHITE,
+    flex: 1,
+    lineHeight: 14,
+  },
 
-  // Command Bar
-  commandBar:           { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingTop: 8, borderTopWidth: 1, borderTopColor: C.volt, backgroundColor: C.black, gap: 8 },
-  commandInputWrapper:  { flex: 1, flexDirection: "row", alignItems: "center", backgroundColor: C.surface, borderWidth: 1, borderColor: C.border, paddingHorizontal: 10, paddingVertical: 9, gap: 8 },
-  commandPrompt:        { fontFamily: MONO, fontSize: 14, color: C.volt, fontWeight: "700" },
-  commandInput:         { flex: 1, fontFamily: MONO, fontSize: 13, color: C.white, letterSpacing: 0.5, padding: 0, margin: 0 },
-  sendBtn:              { backgroundColor: C.volt, paddingHorizontal: 16, paddingVertical: 10, borderRadius: 4, minWidth: 66, alignItems: "center" },
-  sendBtnDisabled:      { backgroundColor: "#1A1A00", borderWidth: 1, borderColor: C.border },
-  sendBtnPressed:       { backgroundColor: "#AADD00", transform: [{ scale: 0.96 }] },
-  sendBtnText:          { fontFamily: MONO, fontSize: 11, fontWeight: "700", color: C.black, letterSpacing: 2 },
-  sendBtnTextDisabled:  { color: C.dim },
+  // ── Urgent controls ────────────────────────────────────────────────────────
+  urgentBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    gap: 6,
+    borderTopWidth: 1,
+    backgroundColor: C.SURFACE,
+  },
+  urgentLabel: {
+    fontFamily: FONT.bold,
+    fontSize: 7,
+    letterSpacing: 1.5,
+    marginRight: 2,
+  },
+  urgentBtn: {
+    flex: 1,
+    borderWidth: 1,
+    paddingVertical: 6,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  urgentBtnText: {
+    fontFamily: FONT.bold,
+    fontSize: 8,
+    letterSpacing: 1,
+  },
 
-  // Danger Flash
-  dangerOverlay:      { flex: 1, backgroundColor: "#1A0000", justifyContent: "center", alignItems: "center", paddingHorizontal: 16 },
-  dangerCard:         { width: "100%", maxWidth: 420, backgroundColor: "#0A0000", borderWidth: 1, borderColor: C.red, overflow: "hidden" },
-  dangerTopBar:       { height: 3, backgroundColor: C.red },
-  dangerHeader:       { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: "#330000" },
-  dangerLabel:        { fontFamily: MONO, fontSize: 15, fontWeight: "700", color: C.red, letterSpacing: 2 },
-  dangerThreatPct:    { fontFamily: MONO, fontSize: 32, fontWeight: "700", color: C.red, letterSpacing: 1 },
-  dangerInfoGrid:     { flexDirection: "row", flexWrap: "wrap", paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: "#330000", gap: 12 },
-  dangerInfoCell:     { width: "47%" },
-  dangerInfoLabel:    { fontFamily: MONO, fontSize: 8, color: C.dim, letterSpacing: 2, marginBottom: 2 },
-  dangerInfoValue:    { fontFamily: MONO, fontSize: 13, color: C.white, fontWeight: "700", letterSpacing: 0.5 },
-  dangerDetail:       { paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: "#330000" },
-  dangerDetailText:   { fontFamily: MONO, fontSize: 12, color: C.orange, letterSpacing: 0.5, lineHeight: 18 },
-  dangerThreatSection:{ paddingHorizontal: 16, paddingVertical: 10 },
-  dangerThreatBarBg:  { height: 6, backgroundColor: "#330000", marginVertical: 6, overflow: "hidden" },
-  dangerThreatBarFill:{ height: 6, backgroundColor: C.red },
-  dangerThreatPctLabel:{ fontFamily: MONO, fontSize: 9, color: C.red, letterSpacing: 2 },
-  dangerControls:     { flexDirection: "row", paddingHorizontal: 16, paddingBottom: 10, gap: 8 },
-  dangerCtrlBtn:      { flex: 1, borderWidth: 1, paddingVertical: 9, alignItems: "center" },
-  dangerCtrlText:     { fontFamily: MONO, fontSize: 9, fontWeight: "700", letterSpacing: 1 },
-  dangerAckBtn:       { marginHorizontal: 16, marginBottom: 12, borderWidth: 1, borderColor: C.dim, paddingVertical: 10, alignItems: "center" },
-  dangerAckText:      { fontFamily: MONO, fontSize: 11, color: C.dim, letterSpacing: 2 },
+  // ── Command bar ────────────────────────────────────────────────────────────
+  commandBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+    gap: 8,
+    borderTopWidth: 1,
+    backgroundColor: C.SURFACE,
+  },
+  commandPrompt: {
+    fontFamily: FONT.bold,
+    fontSize: 14,
+    color: C.VOLT,
+  },
+  commandInput: {
+    flex: 1,
+    fontFamily: FONT.regular,
+    fontSize: 11,
+    color: C.WHITE,
+    letterSpacing: 0.5,
+    paddingVertical: 4,
+  },
+  sendBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 4,
+  },
+  sendBtnText: {
+    fontFamily: FONT.bold,
+    fontSize: 10,
+    letterSpacing: 1.5,
+  },
+
+  // ── Danger flash overlay ───────────────────────────────────────────────────
+  dangerOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(0,0,0,0.92)",
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 999,
+  },
+  dangerCard: {
+    width: SCREEN_W - 32,
+    backgroundColor: C.SURFACE,
+    borderWidth: 1,
+    borderColor: C.RED,
+    padding: 16,
+    gap: 10,
+  },
+  dangerHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    borderBottomWidth: 1,
+    borderBottomColor: C.BORDER2,
+    paddingBottom: 8,
+  },
+  dangerTitle: {
+    fontFamily: FONT.bold,
+    fontSize: 14,
+    letterSpacing: 1.5,
+  },
+  dangerTime: {
+    fontFamily: FONT.regular,
+    fontSize: 9,
+    color: C.MUTED,
+  },
+  dangerSatRow: {
+    flexDirection: "row",
+    gap: 8,
+    alignItems: "flex-start",
+  },
+  dangerSatLabel: {
+    fontFamily: FONT.bold,
+    fontSize: 8,
+    color: C.MUTED,
+    letterSpacing: 1,
+    width: 50,
+    marginTop: 1,
+  },
+  dangerSatValue: {
+    fontFamily: FONT.medium,
+    fontSize: 10,
+    color: C.WHITE,
+    flex: 1,
+    lineHeight: 15,
+  },
+  dangerThreatWrap: {
+    gap: 4,
+  },
+  dangerThreatLabel: {
+    fontFamily: FONT.bold,
+    fontSize: 7,
+    color: C.MUTED,
+    letterSpacing: 1.5,
+  },
+  dangerThreatTrack: {
+    height: 4,
+    backgroundColor: C.BORDER2,
+    width: "100%",
+  },
+  dangerThreatFill: {
+    height: 4,
+  },
+  dangerThreatPct: {
+    fontFamily: FONT.bold,
+    fontSize: 11,
+    letterSpacing: 1,
+  },
+  urgentRow: {
+    flexDirection: "row",
+    gap: 6,
+  },
+  ackBtn: {
+    borderWidth: 1,
+    borderColor: C.VOLT,
+    paddingVertical: 10,
+    alignItems: "center",
+  },
+  ackBtnText: {
+    fontFamily: FONT.bold,
+    fontSize: 11,
+    color: C.VOLT,
+    letterSpacing: 2,
+  },
 });

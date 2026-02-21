@@ -65,3 +65,38 @@
 - [x] Add auto-refresh of TLE data every 6 hours (TLEs degrade over time)
 - [x] Show data source attribution (CelesTrak) in the HUD header and console
 - [x] Handle fetch errors gracefully with per-group error logging and degraded mode
+
+## Operator Satellite Registry & Risk Telemetry
+
+- [x] Design operator satellite data schema (NORAD ID, name, operator, risk fields)
+- [x] Create operator registry screen with tab navigation
+- [x] Build "Register Satellite" form with all risk telemetry fields
+- [x] Build "Submit Risk Event" form for ad-hoc telemetry injection
+- [x] Persist operator satellites and events with AsyncStorage
+- [x] Integrate operator events into the main telemetry feed (marked as OPERATOR)
+- [x] Operator satellites shown with distinct [OP] badge in telemetry rows
+- [x] Operator events trigger danger flash if threat >= 75%
+- [x] Allow editing and deletion of registered operator satellites
+- [x] Show operator satellite count in HUD header
+- [x] Add SATS command output to include operator satellite count
+- [x] Validate all form inputs before submission
+- [x] Add tab bar with HUD and OPERATOR tabs
+
+## Gauss Design System (GDS) Implementation
+
+- [x] Load JetBrains Mono font via expo-font
+- [x] Set true black (#000000) OLED background across all screens
+- [x] Implement GDS color tokens: Volt Green (nominal), Amber (warning), Red (crisis)
+- [x] Apply 250ms glanceability rule — status glow visible at top of every screen
+- [x] Build Bento Box modular layout for HUD screen
+- [x] Implement contextual generative UI — collapse non-essential panels on CRITICAL threat
+- [x] Implement haptic density — distinct patterns for data fetch vs satellite command
+- [x] Build SVG-based orbital arc visualiser (vector-ready for AR)
+- [x] Add status glow ring around node status badge
+- [x] Implement threat-level color cascade across all UI elements
+- [x] Build operator satellite registry screen (tab 2)
+- [x] Build register satellite form with all GDS styling
+- [x] Build submit risk event form with all GDS styling
+- [x] Integrate operator events into live telemetry feed with [OP] badge
+- [x] Add tab bar: HUD (tab 1) and OPERATOR (tab 2)
+- [x] Add icon mappings for new tabs
