@@ -59,6 +59,8 @@ import {
   type SolarActivityLevel,
 } from "@/lib/solar-weather-service";
 import { dataParser } from "@/lib/data-parser";
+import { useAuth } from "@/hooks/use-auth";
+import { useRouter } from "expo-router";
 import {
   checkConnectivity,
   saveTLEsToCache,
@@ -733,6 +735,9 @@ const URGENT_CONTROLS = [
 
 // ─── Main HUD Screen ──────────────────────────────────────────────────────────
 export default function HUDScreen() {
+  const router = useRouter();
+  const { user, isAuthenticated, loading: authLoading } = useAuth();
+
   // ── State ──────────────────────────────────────────────────────────────────
   const [nodeStatus, setNodeStatus]     = useState<NodeStatus>("CONNECTING");
   const [pingMs, setPingMs]             = useState<number | null>(null);
@@ -1262,6 +1267,39 @@ export default function HUDScreen() {
   const criticalCount = events.filter(e => e.type === "CRITICAL").length;
   const anomalyCount  = events.filter(e => e.type === "ANOMALY").length;
 
+  // ── Auth guard ───────────────────────────────────────────────────────────
+  if (authLoading) {
+    return (
+      <SafeAreaView style={[styles.root, { alignItems: "center", justifyContent: "center" }]} edges={["top", "left", "right"]}>
+        <Text style={{ fontFamily: "JetBrainsMono_400Regular", fontSize: 10, color: C.VOLT, letterSpacing: 2 }}>AUTHENTICATING...</Text>
+      </SafeAreaView>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <SafeAreaView style={[styles.root, { alignItems: "center", justifyContent: "center", gap: 16, padding: 24 }]} edges={["top", "left", "right"]}>
+        <Text style={{ fontFamily: "JetBrainsMono_700Bold", fontSize: 14, color: C.VOLT, letterSpacing: 3 }}>GAUSS // MISSION HUD</Text>
+        <Text style={{ fontFamily: "JetBrainsMono_400Regular", fontSize: 10, color: C.MUTED, letterSpacing: 1.5, textAlign: "center" }}>
+          OPERATOR AUTHENTICATION REQUIRED
+        </Text>
+        <Pressable
+          onPress={() => router.push("/login")}
+          style={({ pressed }) => ({
+            backgroundColor: C.VOLT,
+            paddingVertical: 12,
+            paddingHorizontal: 28,
+            borderRadius: 2,
+            opacity: pressed ? 0.85 : 1,
+            transform: [{ scale: pressed ? 0.97 : 1 }],
+          })}
+        >
+          <Text style={{ fontFamily: "JetBrainsMono_700Bold", fontSize: 11, color: C.BLACK, letterSpacing: 2 }}>SIGN IN</Text>
+        </Pressable>
+      </SafeAreaView>
+    );
+  }
+
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <SafeAreaView style={styles.root} edges={["top", "left", "right"]}>
@@ -1277,7 +1315,7 @@ export default function HUDScreen() {
         <View style={styles.header}>
           <View style={styles.headerLeft}>
             <Text style={styles.headerTitle}>GAUSS // MISSION HUD</Text>
-            <Text style={styles.headerSub}>JUDITH · M1 NODE</Text>
+            <Text style={styles.headerSub}>JUDITH · M1 NODE{user?.name ? ` · ${user.name.toUpperCase()}` : ""}</Text>
           </View>
           <View style={styles.headerRight}>
             <StatusGlow status={nodeStatus} />

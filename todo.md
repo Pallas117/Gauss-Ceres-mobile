@@ -208,3 +208,38 @@
 - [ ] Show Earth as a deep blue sphere with lat/lon grid lines
 - [ ] Add LEO/MEO/GEO altitude reference rings
 - [ ] Show solar direction indicator (sun position relative to Earth)
+
+## SSO Login Portal
+
+- [x] Add feedback and sessions tables to drizzle/schema.ts
+- [x] Run database migration (pnpm db:push)
+- [x] Build login screen (app/login.tsx) with Manus OAuth SSO button
+- [x] Add login screen to Expo Router navigation
+- [x] Implement auth guard — redirect unauthenticated users to login screen
+- [x] Show user name in HUD header when authenticated
+- [ ] Add logout option in operator tab or settings
+- [x] Handle OAuth callback deep link on native (app/oauth/callback.tsx already exists)
+- [x] Show loading state during OAuth token exchange
+- [x] Persist session token in SecureStore (native) / cookie (web)
+
+## Feedback Portal
+
+- [x] Build feedback screen (app/(tabs)/feedback.tsx) as third tab
+- [x] Add feedback tab icon mapping in icon-symbol.tsx
+- [x] Add tRPC feedback router in server/routers.ts (protectedProcedure)
+- [x] Add saveFeedback(), listFeedback(), startOperatorSession(), endOperatorSession() DB helpers
+- [x] Feedback form: category selector (Bug / Feature / Data / Other), message textarea, severity (Low/Medium/High/Critical)
+- [x] Submit feedback via tRPC mutation with success banner
+- [x] Show submission confirmation with GDS styling
+- [x] Notify owner on HIGH/CRITICAL feedback via notifyOwner()
+- [x] Show user's own feedback history in the portal
+- [x] Admin view: show all feedback when user.role === 'admin' (adminList procedure)
+
+## Full-Stack Testing
+
+- [x] Write server-side tRPC router tests (auth.me, auth.logout, feedback CRUD)
+- [x] Write DB helper tests (upsertUser, getUserByOpenId, saveFeedback, listFeedback)
+- [x] Write auth flow static analysis + schema validation tests
+- [x] Write feedback portal logic tests (category/severity/validation/notification rules)
+- [x] All 86 tests pass (0 failures, 1 skipped — live server test)
+- [x] Run full test suite — 86 passing, 1 skipped, 0 failures

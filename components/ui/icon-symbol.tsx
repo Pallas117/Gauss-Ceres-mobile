@@ -18,6 +18,13 @@ const MAPPING = {
   "satellite.fill":                          "satellite-alt",
   "exclamationmark.triangle.fill":           "warning",
   "person.badge.plus":                       "person-add",
+  // Auth & feedback icons
+  "person.crop.circle.fill":                  "account-circle",
+  "lock.fill":                                "lock",
+  "bubble.left.and.bubble.right.fill":        "forum",
+  "checkmark.circle.fill":                    "check-circle",
+  "xmark.circle.fill":                        "cancel",
+  "arrow.right.circle.fill":                  "login",
 } as unknown as IconMapping;
 
 export function IconSymbol({

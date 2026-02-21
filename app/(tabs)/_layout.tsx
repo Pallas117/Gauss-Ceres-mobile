@@ -1,6 +1,8 @@
 import { Tabs } from "expo-router";
 import { IconSymbol } from "@/components/ui/icon-symbol";
 
+type AnyIconName = Parameters<typeof IconSymbol>[0]["name"];
+
 const C = {
   BLACK:  "#000000",
   VOLT:   "#CCFF00",
@@ -35,7 +37,11 @@ export default function TabLayout() {
         options={{
           title: "MISSION HUD",
           tabBarIcon: ({ color, size }) => (
-            <IconSymbol name="antenna.radiowaves.left.and.right" color={color} size={size - 2} />
+            <IconSymbol
+              name={"antenna.radiowaves.left.and.right" as AnyIconName}
+              color={color}
+              size={size - 2}
+            />
           ),
         }}
       />
@@ -44,7 +50,24 @@ export default function TabLayout() {
         options={{
           title: "OPERATOR",
           tabBarIcon: ({ color, size }) => (
-            <IconSymbol name="antenna.radiowaves.left.and.right" color={color} size={size - 2} />
+            <IconSymbol
+              name={"person.badge.plus" as AnyIconName}
+              color={color}
+              size={size - 2}
+            />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="feedback"
+        options={{
+          title: "FEEDBACK",
+          tabBarIcon: ({ color, size }) => (
+            <IconSymbol
+              name={"bubble.left.and.bubble.right.fill" as AnyIconName}
+              color={color}
+              size={size - 2}
+            />
           ),
         }}
       />

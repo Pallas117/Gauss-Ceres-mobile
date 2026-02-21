@@ -1,6 +1,13 @@
-import { eq } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import { InsertUser, users } from "../drizzle/schema";
+import {
+  InsertUser,
+  InsertFeedback,
+  InsertOperatorSession,
+  feedback,
+  operatorSessions,
+  users,
+} from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -18,6 +25,8 @@ export async function getDb() {
   return _db;
 }
 
+// ─── Users ───────────────────────────────────────────────────────────────────
+
 export async function upsertUser(user: InsertUser): Promise<void> {
   if (!user.openId) {
     throw new Error("User openId is required for upsert");
@@ -30,9 +39,7 @@ export async function upsertUser(user: InsertUser): Promise<void> {
   }
 
   try {
-    const values: InsertUser = {
-      openId: user.openId,
-    };
+    const values: InsertUser = { openId: user.openId };
     const updateSet: Record<string, unknown> = {};
 
     const textFields = ["name", "email", "loginMethod"] as const;
@@ -68,9 +75,7 @@ export async function upsertUser(user: InsertUser): Promise<void> {
       updateSet.lastSignedIn = new Date();
     }
 
-    await db.insert(users).values(values).onDuplicateKeyUpdate({
-      set: updateSet,
-    });
+    await db.insert(users).values(values).onDuplicateKeyUpdate({ set: updateSet });
   } catch (error) {
     console.error("[Database] Failed to upsert user:", error);
     throw error;
@@ -83,10 +88,85 @@ export async function getUserByOpenId(openId: string) {
     console.warn("[Database] Cannot get user: database not available");
     return undefined;
   }
-
   const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
-
   return result.length > 0 ? result[0] : undefined;
 }
 
-// TODO: add feature queries here as your schema grows.
+export async function getUserById(id: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db.select().from(users).where(eq(users.id, id)).limit(1);
+  return result.length > 0 ? result[0] : undefined;
+}
+
+// ─── Feedback ────────────────────────────────────────────────────────────────
+
+export async function saveFeedback(data: InsertFeedback): Promise<number> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const result = await db.insert(feedback).values(data);
+  return (result as unknown as { insertId: number }).insertId;
+}
+
+export async function listFeedbackByUser(userId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(feedback)
+    .where(eq(feedback.userId, userId))
+    .orderBy(desc(feedback.createdAt))
+    .limit(50);
+}
+
+export async function listAllFeedback() {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select().from(feedback).orderBy(desc(feedback.createdAt)).limit(200);
+}
+
+export async function resolveFeedback(id: number, adminNote?: string) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  await db
+    .update(feedback)
+    .set({ isResolved: true, resolvedAt: new Date(), adminNote: adminNote ?? null })
+    .where(eq(feedback.id, id));
+}
+
+// ─── Operator Sessions ───────────────────────────────────────────────────────
+
+export async function startOperatorSession(data: InsertOperatorSession): Promise<number> {
+  const db = await getDb();
+  if (!db) return -1;
+  const result = await db.insert(operatorSessions).values(data);
+  return (result as unknown as { insertId: number }).insertId;
+}
+
+export async function endOperatorSession(
+  id: number,
+  stats: {
+    eventsProcessed?: number;
+    commandsSent?: number;
+    dangerAcknowledged?: number;
+    peakThreatPct?: number;
+  },
+) {
+  const db = await getDb();
+  if (!db) return;
+  await db
+    .update(operatorSessions)
+    .set({ endedAt: new Date(), ...stats })
+    .where(eq(operatorSessions.id, id));
+}
+
+export async function listSessionsByUser(userId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(operatorSessions)
+    .where(eq(operatorSessions.userId, userId))
+    .orderBy(desc(operatorSessions.startedAt))
+    .limit(20);
+}
