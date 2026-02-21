@@ -1,45 +1,41 @@
-/**
- * Gauss Design System (GDS) — Theme Configuration
- *
- * OLED-First Architecture: true black (#000000) background turns off pixels
- * on OLED screens, extending mission battery life by up to 30%.
- *
- * Color Semantics:
- *   Volt Green (#CCFF00) = NOMINAL / ONLINE / SUCCESS
- *   Amber (#FFAA00)      = WARNING / ELEVATED
- *   Red (#FF2222)        = CRISIS / CRITICAL / OFFLINE
- *   White (#FFFFFF)      = PRIMARY TEXT / COMMANDS
- */
-
 /** @type {const} */
 const themeColors = {
-  // ── Core GDS Palette ──────────────────────────────────────────────────────
-  primary:    { light: "#CCFF00", dark: "#CCFF00" },   // Volt Green — nominal state
-  background: { light: "#000000", dark: "#000000" },   // True OLED black
-  surface:    { light: "#0A0A0A", dark: "#0A0A0A" },   // Bento card background
-  surface2:   { light: "#111111", dark: "#111111" },   // Elevated surface
-  foreground: { light: "#FFFFFF", dark: "#FFFFFF" },   // Primary text
-  muted:      { light: "#666666", dark: "#666666" },   // Secondary text
-  border:     { light: "#1A1A1A", dark: "#1A1A1A" },   // Subtle dividers
-  border2:    { light: "#2A2A2A", dark: "#2A2A2A" },   // Visible dividers
+  // ── Base ──────────────────────────────────────────────────────────────────
+  // Deep blue OLED-first architecture — true dark with blue tint
+  background:  { light: '#020B18', dark: '#020B18' }, // Deep space blue (OLED)
+  surface:     { light: '#071428', dark: '#071428' }, // Navy card surface
+  surfaceAlt:  { light: '#0A1E3A', dark: '#0A1E3A' }, // Slightly lighter card
+  border:      { light: '#0F2A4A', dark: '#0F2A4A' }, // Navy border
+  borderBright:{ light: '#1A3F6F', dark: '#1A3F6F' }, // Bright border for focus
 
-  // ── Status Colors ─────────────────────────────────────────────────────────
-  nominal:    { light: "#CCFF00", dark: "#CCFF00" },   // Volt Green
-  warning:    { light: "#FFAA00", dark: "#FFAA00" },   // Amber
-  crisis:     { light: "#FF2222", dark: "#FF2222" },   // Crisis Red
+  // ── Text ──────────────────────────────────────────────────────────────────
+  foreground:  { light: '#E8F4FF', dark: '#E8F4FF' }, // Ice white text
+  muted:       { light: '#4A7FA8', dark: '#4A7FA8' }, // Steel blue muted text
+  dim:         { light: '#1E3A5A', dark: '#1E3A5A' }, // Very dim text / labels
 
-  // ── Standard semantic aliases ─────────────────────────────────────────────
-  success:    { light: "#CCFF00", dark: "#CCFF00" },
-  error:      { light: "#FF2222", dark: "#FF2222" },
-  tint:       { light: "#CCFF00", dark: "#CCFF00" },
+  // ── Accent / Primary ──────────────────────────────────────────────────────
+  primary:     { light: '#1E90FF', dark: '#1E90FF' }, // Electric blue (primary accent)
+  tint:        { light: '#1E90FF', dark: '#1E90FF' }, // Tab bar tint
+  glow:        { light: '#0A4A8A', dark: '#0A4A8A' }, // Blue glow / shadow
 
-  // ── Telemetry event type colors ───────────────────────────────────────────
-  pass:       { light: "#CCFF00", dark: "#CCFF00" },   // PASS — Volt Green
-  lock:       { light: "#00CCFF", dark: "#00CCFF" },   // LOCK — Cyan
-  signal:     { light: "#FFFFFF", dark: "#FFFFFF" },   // SIGNAL — White
-  drift:      { light: "#FFAA00", dark: "#FFAA00" },   // DRIFT — Amber
-  anomaly:    { light: "#FF6600", dark: "#FF6600" },   // ANOMALY — Orange
-  critical:   { light: "#FF2222", dark: "#FF2222" },   // CRITICAL — Red
+  // ── Status / Alert ────────────────────────────────────────────────────────
+  // Volt green kept for NOMINAL / ONLINE — high contrast against deep blue
+  volt:        { light: '#CCFF00', dark: '#CCFF00' }, // Volt green — NOMINAL
+  voltDim:     { light: '#4A5C00', dark: '#4A5C00' }, // Dim volt for backgrounds
+  amber:       { light: '#FFB300', dark: '#FFB300' }, // Amber — WARNING
+  amberDim:    { light: '#4A3300', dark: '#4A3300' }, // Dim amber
+  error:       { light: '#FF2222', dark: '#FF2222' }, // Red — CRITICAL/DANGER
+  errorDim:    { light: '#4A0808', dark: '#4A0808' }, // Dim red
+  success:     { light: '#00E676', dark: '#00E676' }, // Green — SUCCESS
+  warning:     { light: '#FFB300', dark: '#FFB300' }, // Warning alias
+
+  // ── Orbital ring colours ───────────────────────────────────────────────────
+  orbitRed:    { light: '#FF3A3A', dark: '#FF3A3A' }, // Rank 1 orbit
+  orbitAmber:  { light: '#FFB300', dark: '#FFB300' }, // Rank 2 orbit
+  orbitVolt:   { light: '#CCFF00', dark: '#CCFF00' }, // Rank 3 orbit
+  orbitBlue:   { light: '#1E90FF', dark: '#1E90FF' }, // Reference rings
+  earthBlue:   { light: '#0D3B6E', dark: '#0D3B6E' }, // Earth sphere fill
+  earthGlow:   { light: '#1565C0', dark: '#1565C0' }, // Earth atmosphere glow
 };
 
 module.exports = { themeColors };

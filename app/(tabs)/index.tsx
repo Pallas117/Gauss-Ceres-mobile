@@ -59,6 +59,24 @@ import {
   type SolarActivityLevel,
 } from "@/lib/solar-weather-service";
 import { dataParser } from "@/lib/data-parser";
+import {
+  checkConnectivity,
+  saveTLEsToCache,
+  getOfflineTLEs,
+  saveWeatherToCache,
+  loadCachedWeather,
+  getOfflineSummary,
+  type ConnectivityState,
+} from "@/lib/offline-store";
+import {
+  fetchConjunctions,
+  formatProbability,
+  formatDistance,
+  formatSpeed,
+  hoursUntilTCA,
+  conjunctionThreatBoost,
+  type ConjunctionState,
+} from "@/lib/conjunction-service";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 const TAILSCALE_IP = "100.x.x.x"; // Replace with your Tailscale IP
@@ -66,21 +84,27 @@ const BASE_URL     = `http://${TAILSCALE_IP}:8080`;
 const HEALTH_URL   = `${BASE_URL}/status`;
 const REASON_URL   = `${BASE_URL}/reason`;
 
-// ─── GDS Color Palette ────────────────────────────────────────────────────────
+// ─── GDS Color Palette (Deep Blue Edition) ──────────────────────────────────
 const C = {
-  BLACK:    "#000000",
-  SURFACE:  "#0A0A0A",
-  SURFACE2: "#111111",
-  BORDER:   "#1A1A1A",
-  BORDER2:  "#2A2A2A",
-  WHITE:    "#FFFFFF",
-  MUTED:    "#666666",
-  MUTED2:   "#444444",
-  VOLT:     "#CCFF00",   // Nominal
-  AMBER:    "#FFAA00",   // Warning
-  RED:      "#FF2222",   // Crisis
-  CYAN:     "#00CCFF",   // Lock
+  BLACK:    "#020B18",   // Deep space blue (OLED base)
+  SURFACE:  "#071428",   // Navy card surface
+  SURFACE2: "#0A1E3A",   // Slightly lighter card
+  BORDER:   "#0F2A4A",   // Navy border
+  BORDER2:  "#1A3F6F",   // Bright border
+  WHITE:    "#E8F4FF",   // Ice white
+  MUTED:    "#4A7FA8",   // Steel blue muted
+  MUTED2:   "#1E3A5A",   // Very dim
+  VOLT:     "#CCFF00",   // Volt green — NOMINAL (kept for high contrast)
+  AMBER:    "#FFB300",   // Amber — WARNING
+  RED:      "#FF2222",   // Red — CRISIS
+  CYAN:     "#00CCFF",   // Lock / electric blue
   ORANGE:   "#FF6600",   // Anomaly
+  BLUE:     "#1E90FF",   // Electric blue accent
+  EARTH:    "#0D3B6E",   // Earth sphere fill
+  EARTHGLOW:"#1565C0",   // Earth atmosphere
+  ORBITRED: "#FF3A3A",   // Rank 1 orbit
+  ORBITAMB: "#FFB300",   // Rank 2 orbit
+  ORBITVOLT:"#CCFF00",   // Rank 3 orbit
 } as const;
 
 // ─── GDS Typography ───────────────────────────────────────────────────────────
@@ -123,31 +147,112 @@ function genId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
-// ─── SVG Orbital Arc Visualiser ───────────────────────────────────────────────
-// World-map equirectangular projection with real satellite positions.
-// Shows top-12 highest-risk satellites. AR/HUD-ready — pure SVG vectors.
+// ─── 3D Orbital Sphere Visualiser ────────────────────────────────────────────
+// Orthographic projection of Earth as a sphere with orbital shells.
+// Satellites rendered at their true 3D positions. Rotates slowly over time.
+// Pure SVG — no native dependencies, works on iOS/Android/Web.
 interface OrbitalArcProps {
   events: TelemetryEvent[];
   threatLevel: "NOMINAL" | "WARNING" | "CRISIS";
   lastPropagated?: Date | null;
   groundTracks?: Array<{ segments: GroundTrackSegment[]; color: string; name: string; rank: number }>;
+  conjunctions?: ConjunctionState | null;
 }
 
-// Convert geographic lat/lon to SVG x/y on an equirectangular projection
-function latLonToXY(lat: number, lon: number, W: number, H: number): { x: number; y: number } {
-  const x = ((lon + 180) / 360) * W;
-  const y = ((90 - lat) / 180) * H;
-  return { x, y };
+// Convert lat/lon/alt to 3D ECI-like unit sphere coordinates, then orthographic project
+// Returns null if on the far side of the sphere (hidden)
+function latLonAltToSphere(
+  lat: number,
+  lon: number,
+  altKm: number,
+  rotationRad: number,  // scene rotation angle (auto-spin)
+  cx: number,           // sphere centre x
+  cy: number,           // sphere centre y
+  R: number,            // earth radius in SVG units
+): { x: number; y: number; r: number; visible: boolean } {
+  const earthR = 6371;
+  const totalR = earthR + Math.max(altKm, 0);
+  const scaledR = R * (totalR / earthR);
+
+  const latR = (lat * Math.PI) / 180;
+  const lonR = ((lon + rotationRad * 180 / Math.PI) * Math.PI) / 180;
+
+  // 3D position on sphere
+  const x3 = scaledR * Math.cos(latR) * Math.cos(lonR);
+  const y3 = scaledR * Math.sin(latR);
+  const z3 = scaledR * Math.cos(latR) * Math.sin(lonR);
+
+  // Orthographic projection: x→right, y→up, z→depth
+  // visible if z3 > 0 (front hemisphere)
+  return {
+    x: cx + x3,
+    y: cy - y3,
+    r: scaledR,
+    visible: z3 >= -scaledR * 0.15, // show slightly past limb
+  };
 }
 
-function OrbitalArcVisualiser({ events, threatLevel, lastPropagated, groundTracks = [] }: OrbitalArcProps) {
+// Build an SVG ellipse path for an orbital ring at given inclination and altitude
+function orbitalRingPath(
+  inclinationDeg: number,
+  altKm: number,
+  rotationRad: number,
+  cx: number,
+  cy: number,
+  R: number,
+): string {
+  const earthR = 6371;
+  const orbitR = R * ((earthR + altKm) / earthR);
+  const inc = (inclinationDeg * Math.PI) / 180;
+  const rot = rotationRad;
+
+  // Sample 64 points around the orbit
+  const pts: string[] = [];
+  const N = 64;
+  for (let i = 0; i <= N; i++) {
+    const theta = (i / N) * 2 * Math.PI;
+    // Orbit in inclined plane: x=cos(theta), y=sin(theta)*cos(inc), z=sin(theta)*sin(inc)
+    const ox = orbitR * Math.cos(theta);
+    const oy = orbitR * Math.sin(theta) * Math.cos(inc);
+    const oz = orbitR * Math.sin(theta) * Math.sin(inc);
+
+    // Apply scene rotation around Y axis
+    const rx = ox * Math.cos(rot) + oz * Math.sin(rot);
+    const ry = oy;
+    // rz = -ox * sin(rot) + oz * cos(rot)  (depth)
+    const rz = -ox * Math.sin(rot) + oz * Math.cos(rot);
+
+    // Only draw front-facing portions (rz > -orbitR * 0.1)
+    if (rz < -orbitR * 0.1) {
+      if (pts.length > 0) pts.push("Z"); // break path
+      continue;
+    }
+    pts.push(`${i === 0 || pts[pts.length - 1] === "Z" ? "M" : "L"}${(cx + rx).toFixed(1)} ${(cy - ry).toFixed(1)}`);
+  }
+  return pts.join(" ");
+}
+
+function OrbitalArcVisualiser({ events, threatLevel, lastPropagated, groundTracks = [], conjunctions }: OrbitalArcProps) {
   const W = SCREEN_W - 32;
-  const H = 160;
+  const H = 220;
+  const cx = W / 2;
+  const cy = H / 2;
+  const R = Math.min(W, H) * 0.32; // Earth radius in SVG units
+
   const glowColor =
     threatLevel === "CRISIS"  ? C.RED  :
     threatLevel === "WARNING" ? C.AMBER : C.VOLT;
 
-  // Latency timer: seconds since last propagation
+  // Auto-rotation: slow spin (1 full rotation per 120s)
+  const [rotAngle, setRotAngle] = React.useState(0);
+  React.useEffect(() => {
+    const t = setInterval(() => {
+      setRotAngle(a => (a + 0.008) % (2 * Math.PI));
+    }, 50);
+    return () => clearInterval(t);
+  }, []);
+
+  // Latency timer
   const [dataAgeSec, setDataAgeSec] = React.useState(0);
   React.useEffect(() => {
     const t = setInterval(() => {
@@ -158,157 +263,172 @@ function OrbitalArcVisualiser({ events, threatLevel, lastPropagated, groundTrack
     return () => clearInterval(t);
   }, [lastPropagated]);
 
-  // Top 12 highest-risk satellites with real lat/lon (for position dots)
+  // Top satellites with real lat/lon/alt
   const riskySats = events
     .filter(e => e.lat !== undefined && e.lon !== undefined && !e.isOperator)
     .sort((a, b) => b.threatPct - a.threatPct)
-    .slice(0, 12);
+    .slice(0, 20);
 
-  // World map grid lines (equirectangular)
-  const latLines = [-60, -30, 0, 30, 60];
-  const lonLines = [-120, -60, 0, 60, 120];
-
-  // Orbit altitude rings (approximate equatorial projections)
-  // LEO ~400km, MEO ~20000km, GEO ~35786km — shown as horizontal bands
-  const orbitRings = [
-    { label: "LEO", yFrac: 0.35, opacity: 0.35 },
-    { label: "MEO", yFrac: 0.22, opacity: 0.22 },
-    { label: "GEO", yFrac: 0.08, opacity: 0.14 },
+  // Orbital shells to draw (inclination, altitude, label, opacity)
+  const shells = [
+    { inc: 53,  alt: 550,   label: "LEO",  opacity: 0.18, color: C.VOLT   },
+    { inc: 0,   alt: 20200, label: "MEO",  opacity: 0.12, color: C.CYAN   },
+    { inc: 0,   alt: 35786, label: "GEO",  opacity: 0.10, color: C.BLUE   },
   ];
+
+  // Graticule: latitude circles on the sphere surface
+  const latCircles = [-60, -30, 0, 30, 60];
+
+  // Earth sphere: draw as circle with atmosphere ring
+  const earthR = R;
+  const atmosphereR = R * 1.04;
+
+  // Conjunction lines: draw a line between the two objects at TCA
+  const conjLines = (conjunctions?.events ?? []).slice(0, 5).map(ev => {
+    const p1 = latLonAltToSphere(0, 0, 550, rotAngle, cx, cy, R); // approx LEO
+    const p2 = latLonAltToSphere(0, 90, 550, rotAngle, cx, cy, R);
+    return { p1, p2, prob: ev.collisionProbability3D, name1: ev.obj1Name, name2: ev.obj2Name };
+  });
 
   return (
     <View>
       <Svg width={W} height={H} viewBox={`0 0 ${W} ${H}`}>
-        {/* Background */}
-        <Rect x={0} y={0} width={W} height={H} fill="#000000" />
+        {/* Deep space background */}
+        <Rect x={0} y={0} width={W} height={H} fill={C.BLACK} />
 
-        {/* World map grid — equirectangular graticule */}
-        {latLines.map(lat => {
-          const { y } = latLonToXY(lat, 0, W, H);
+        {/* Star field — static dots */}
+        {[
+          [12, 18], [45, 8], [78, 25], [110, 12], [145, 30], [180, 6], [210, 22], [240, 15],
+          [270, 28], [300, 10], [330, 20], [350, 35], [28, 45], [65, 55], [95, 42], [130, 60],
+          [160, 48], [195, 65], [225, 52], [255, 70], [285, 44], [315, 58], [345, 72], [15, 80],
+          [50, 90], [85, 75], [120, 85], [155, 95], [190, 82], [220, 100], [250, 88], [280, 105],
+          [310, 78], [340, 92], [8, 110], [42, 120], [75, 108], [108, 125], [142, 115], [175, 130],
+          [205, 118], [235, 135], [265, 122], [295, 140], [325, 128], [355, 145], [20, 155],
+          [55, 165], [90, 152], [125, 170], [158, 158], [192, 175], [222, 162], [252, 178],
+          [282, 165], [312, 180], [342, 168], [5, 185], [38, 195], [72, 182], [105, 200],
+          [140, 188], [173, 205], [203, 192], [233, 208], [263, 195], [293, 210], [323, 198],
+        ].map(([sx, sy], i) => (
+          <Circle key={`star${i}`} cx={sx} cy={sy} r={i % 5 === 0 ? 0.8 : 0.5}
+            fill={C.WHITE} fillOpacity={0.15 + (i % 4) * 0.07} />
+        ))}
+
+        {/* Atmosphere glow ring */}
+        <Circle cx={cx} cy={cy} r={atmosphereR + 4}
+          fill="none" stroke={C.EARTHGLOW} strokeWidth={6} strokeOpacity={0.08} />
+        <Circle cx={cx} cy={cy} r={atmosphereR + 2}
+          fill="none" stroke={C.EARTHGLOW} strokeWidth={3} strokeOpacity={0.12} />
+        <Circle cx={cx} cy={cy} r={atmosphereR}
+          fill="none" stroke={C.EARTHGLOW} strokeWidth={1.5} strokeOpacity={0.25} />
+
+        {/* Earth sphere */}
+        <Circle cx={cx} cy={cy} r={earthR}
+          fill={C.EARTH} stroke={C.EARTHGLOW} strokeWidth={0.8} strokeOpacity={0.6} />
+
+        {/* Earth latitude graticule lines (approximate as ellipses) */}
+        {latCircles.map(lat => {
+          const latR = (lat * Math.PI) / 180;
+          const ry = earthR * Math.abs(Math.cos(latR));
+          const yOff = -earthR * Math.sin(latR);
+          if (ry < 2) return null;
           return (
-            <Line
+            <Ellipse
               key={`lat${lat}`}
-              x1={0} y1={y} x2={W} y2={y}
-              stroke={C.BORDER2}
+              cx={cx} cy={cy + yOff}
+              rx={ry} ry={ry * 0.15}
+              fill="none"
+              stroke={lat === 0 ? C.CYAN : C.BORDER2}
               strokeWidth={lat === 0 ? 0.8 : 0.4}
-              strokeOpacity={lat === 0 ? 0.6 : 0.3}
-              strokeDasharray={lat === 0 ? undefined : "2 4"}
-            />
-          );
-        })}
-        {lonLines.map(lon => {
-          const { x } = latLonToXY(0, lon, W, H);
-          return (
-            <Line
-              key={`lon${lon}`}
-              x1={x} y1={0} x2={x} y2={H}
-              stroke={C.BORDER2}
-              strokeWidth={lon === 0 ? 0.8 : 0.4}
-              strokeOpacity={lon === 0 ? 0.6 : 0.3}
-              strokeDasharray={lon === 0 ? undefined : "2 4"}
+              strokeOpacity={lat === 0 ? 0.4 : 0.2}
+              strokeDasharray={lat === 0 ? undefined : "2 3"}
             />
           );
         })}
 
-        {/* Orbit altitude rings as horizontal bands */}
-        {orbitRings.map(ring => {
-          const topY = ring.yFrac * H;
-          const botY = H - ring.yFrac * H;
+        {/* Terminator line (day/night boundary) — approximate as ellipse */}
+        <Ellipse
+          cx={cx} cy={cy}
+          rx={earthR * 0.12} ry={earthR}
+          fill="none"
+          stroke={C.MUTED2}
+          strokeWidth={0.6}
+          strokeOpacity={0.4}
+          strokeDasharray="3 4"
+        />
+
+        {/* Orbital shells */}
+        {shells.map((shell) => {
+          const d = orbitalRingPath(shell.inc, shell.alt, rotAngle, cx, cy, R);
+          if (!d) return null;
           return (
-            <React.Fragment key={ring.label}>
-              <Line x1={0} y1={topY} x2={W} y2={topY}
-                stroke={glowColor} strokeWidth={0.5} strokeOpacity={ring.opacity}
-                strokeDasharray="4 6"
+            <React.Fragment key={shell.label}>
+              <Path
+                d={d}
+                fill="none"
+                stroke={shell.color}
+                strokeWidth={0.6}
+                strokeOpacity={shell.opacity}
+                strokeDasharray="4 5"
               />
-              <Line x1={0} y1={botY} x2={W} y2={botY}
-                stroke={glowColor} strokeWidth={0.5} strokeOpacity={ring.opacity}
-                strokeDasharray="4 6"
-              />
-              <SvgText x={4} y={topY - 2} fontSize={6} fill={glowColor}
-                fillOpacity={ring.opacity * 1.8} fontFamily={FONT.regular}>
-                {ring.label}
+              {/* Shell label at right edge */}
+              <SvgText
+                x={cx + R * ((6371 + shell.alt) / 6371) + 3}
+                y={cy + 3}
+                fontSize={6}
+                fill={shell.color}
+                fillOpacity={shell.opacity * 2.5}
+                fontFamily={FONT.regular}
+              >
+                {shell.label}
               </SvgText>
             </React.Fragment>
           );
         })}
 
-        {/* Ground tracks for top-3 riskiest satellites */}
-        {groundTracks.map((track) => (
-          <React.Fragment key={`track-${track.rank}`}>
-            {track.segments.map((seg, si) => {
-              if (seg.points.length < 2) return null;
-              // Build SVG polyline path string
-              const d = seg.points.map((p, pi) => {
-                const { x, y } = latLonToXY(p.lat, p.lon, W, H);
-                return `${pi === 0 ? 'M' : 'L'}${x.toFixed(1)} ${y.toFixed(1)}`;
-              }).join(' ');
-              return (
-                <Path
-                  key={`seg-${si}`}
-                  d={d}
-                  stroke={track.color}
-                  strokeWidth={track.rank === 1 ? 1.2 : 0.8}
-                  strokeOpacity={track.rank === 1 ? 0.7 : track.rank === 2 ? 0.55 : 0.4}
-                  fill="none"
-                  strokeDasharray={track.rank === 1 ? undefined : track.rank === 2 ? "3 3" : "2 4"}
-                />
-              );
-            })}
-          </React.Fragment>
-        ))}
-
-        {/* Satellite position dots */}
+        {/* Satellite dots — projected onto sphere */}
         {riskySats.map((sat) => {
-          const { x, y } = latLonToXY(sat.lat!, sat.lon!, W, H);
+          const proj = latLonAltToSphere(
+            sat.lat!, sat.lon!, sat.altKm ?? 550,
+            rotAngle, cx, cy, R
+          );
+          if (!proj.visible) return null;
           const color = EVENT_COLORS[sat.type] ?? C.VOLT;
           const isCritical = sat.threatPct >= DANGER_THRESHOLD;
           const isHigh = sat.threatPct >= 50;
-          const r = isCritical ? 4 : isHigh ? 3 : 2;
+          const dotR = isCritical ? 3.5 : isHigh ? 2.5 : 1.8;
 
           return (
             <React.Fragment key={sat.id}>
-              {/* Glow ring for high-threat */}
+              {/* Glow halo */}
               {isCritical && (
-                <Circle cx={x} cy={y} r={r + 4} fill={color} fillOpacity={0.12} />
+                <Circle cx={proj.x} cy={proj.y} r={dotR + 5}
+                  fill={color} fillOpacity={0.08} />
               )}
-              {isHigh && !isCritical && (
-                <Circle cx={x} cy={y} r={r + 2} fill={color} fillOpacity={0.08} />
+              {isHigh && (
+                <Circle cx={proj.x} cy={proj.y} r={dotR + 3}
+                  fill={color} fillOpacity={0.06} />
               )}
               {/* Main dot */}
-              <Circle cx={x} cy={y} r={r} fill={color} fillOpacity={0.95} />
+              <Circle cx={proj.x} cy={proj.y} r={dotR}
+                fill={color} fillOpacity={0.95} />
               {/* Crosshair for critical */}
               {isCritical && (
                 <>
-                  <Line x1={x - 6} y1={y} x2={x - r - 1} y2={y} stroke={color} strokeWidth={0.8} strokeOpacity={0.7} />
-                  <Line x1={x + r + 1} y1={y} x2={x + 6} y2={y} stroke={color} strokeWidth={0.8} strokeOpacity={0.7} />
-                  <Line x1={x} y1={y - 6} x2={x} y2={y - r - 1} stroke={color} strokeWidth={0.8} strokeOpacity={0.7} />
-                  <Line x1={x} y1={y + r + 1} x2={x} y2={y + 6} stroke={color} strokeWidth={0.8} strokeOpacity={0.7} />
+                  <Line x1={proj.x - 7} y1={proj.y} x2={proj.x - dotR - 1} y2={proj.y}
+                    stroke={color} strokeWidth={0.8} strokeOpacity={0.7} />
+                  <Line x1={proj.x + dotR + 1} y1={proj.y} x2={proj.x + 7} y2={proj.y}
+                    stroke={color} strokeWidth={0.8} strokeOpacity={0.7} />
+                  <Line x1={proj.x} y1={proj.y - 7} x2={proj.x} y2={proj.y - dotR - 1}
+                    stroke={color} strokeWidth={0.8} strokeOpacity={0.7} />
+                  <Line x1={proj.x} y1={proj.y + dotR + 1} x2={proj.x} y2={proj.y + 7}
+                    stroke={color} strokeWidth={0.8} strokeOpacity={0.7} />
                 </>
               )}
-              {/* Name label — only for top 6 */}
-              {riskySats.indexOf(sat) < 6 && (
-                <SvgText
-                  x={x + r + 2}
-                  y={y - 2}
-                  fontSize={6}
-                  fill={color}
-                  fillOpacity={0.85}
-                  fontFamily={FONT.regular}
-                >
+              {/* Name label for top 5 */}
+              {riskySats.indexOf(sat) < 5 && (
+                <SvgText x={proj.x + dotR + 2} y={proj.y - 2}
+                  fontSize={6} fill={color} fillOpacity={0.85}
+                  fontFamily={FONT.regular}>
                   {sat.satName.slice(0, 10)}
-                </SvgText>
-              )}
-              {/* Threat % for critical */}
-              {isCritical && (
-                <SvgText
-                  x={x + r + 2}
-                  y={y + 7}
-                  fontSize={6}
-                  fill={color}
-                  fillOpacity={0.7}
-                  fontFamily={FONT.regular}
-                >
-                  {sat.threatPct}%
                 </SvgText>
               )}
             </React.Fragment>
@@ -322,48 +442,45 @@ function OrbitalArcVisualiser({ events, threatLevel, lastPropagated, groundTrack
           [4, H - 4, 14, H - 4, 4, H - 14],
           [W - 4, H - 4, W - 14, H - 4, W - 4, H - 14],
         ].map(([x1, y1, x2, y2, x3, y3], i) => (
-          <Path
-            key={i}
+          <Path key={i}
             d={`M${x1} ${y1} L${x2} ${y2} M${x1} ${y1} L${x3} ${y3}`}
-            stroke={glowColor}
-            strokeWidth={1.5}
-            strokeOpacity={0.6}
+            stroke={glowColor} strokeWidth={1.5} strokeOpacity={0.6}
           />
         ))}
 
         {/* Threat level — top left */}
-        <SvgText x={6} y={12} fontSize={7} fill={glowColor} fillOpacity={0.8}
-          fontFamily={FONT.bold}>
-          {threatLevel}
-        </SvgText>
+        <SvgText x={6} y={12} fontSize={7} fill={glowColor} fillOpacity={0.9}
+          fontFamily={FONT.bold}>{threatLevel}</SvgText>
 
-        {/* Data age timer — top right */}
+        {/* Data age — top right */}
         <SvgText x={W - 6} y={12} fontSize={7}
           fill={dataAgeSec > 30 ? C.AMBER : C.MUTED}
-          fillOpacity={0.9}
-          textAnchor="end"
-          fontFamily={FONT.regular}
-        >
+          fillOpacity={0.9} textAnchor="end" fontFamily={FONT.regular}>
           {lastPropagated ? `T+${dataAgeSec}s` : "ACQUIRING"}
         </SvgText>
 
-        {/* Satellite count — bottom left */}
+        {/* Sat count — bottom left */}
         <SvgText x={6} y={H - 5} fontSize={6} fill={C.MUTED} fillOpacity={0.7}
           fontFamily={FONT.regular}>
-          {groundTracks.length > 0 ? `TRACK: ${groundTracks.map(t => t.name.slice(0,8)).join(' · ')}` : `TOP ${riskySats.length} RISK`}
+          {riskySats.length} SATS · 3D ORBITAL VIEW
         </SvgText>
 
-        {/* Equator label */}
-        <SvgText
-          x={W - 6}
-          y={H / 2 - 3}
-          fontSize={6}
-          fill={C.BORDER2}
-          fillOpacity={0.8}
-          textAnchor="end"
-          fontFamily={FONT.regular}
-        >
-          EQ
+        {/* Conjunction count — bottom right */}
+        {conjunctions && (
+          <SvgText x={W - 6} y={H - 5} fontSize={6}
+            fill={conjunctions.highRiskCount > 0 ? C.RED : C.MUTED}
+            fillOpacity={0.8} textAnchor="end" fontFamily={FONT.regular}>
+            {conjunctions.highRiskCount > 0
+              ? `⚠ ${conjunctions.highRiskCount} HIGH-RISK CONJ`
+              : `${conjunctions.totalCount} CONJ EVENTS`
+            }
+          </SvgText>
+        )}
+
+        {/* Privateer attribution — bottom centre */}
+        <SvgText x={cx} y={H - 5} fontSize={5} fill={C.MUTED} fillOpacity={0.4}
+          textAnchor="middle" fontFamily={FONT.regular}>
+          CONJUNCTION DATA: PRIVATEER CROW'S NEST
         </SvgText>
       </Svg>
     </View>
@@ -644,6 +761,14 @@ export default function HUDScreen() {
   const [lastSolarFetch, setLastSolarFetch]   = useState<Date | null>(null);
   const [solarDangerFired, setSolarDangerFired] = useState(false);
 
+  // Privateer Crow's Nest conjunction state
+  const [conjunctions, setConjunctions]           = useState<ConjunctionState | null>(null);
+  const [isFetchingConj, setIsFetchingConj]       = useState(false);
+
+  // Offline / connectivity state
+  const [connectivity, setConnectivity]           = useState<ConnectivityState>("UNKNOWN");
+  const [isOffline, setIsOffline]                 = useState(false);
+
   // Contextual UI: collapse non-essential panels on CRISIS
   const [threatLevel, setThreatLevel]   = useState<"NOMINAL" | "WARNING" | "CRISIS">("NOMINAL");
   const [showOrbitalArc, setShowOrbitalArc] = useState(true);
@@ -694,6 +819,8 @@ export default function HUDScreen() {
       const weather = await fetchSpaceWeather();
       setSolarWeather(weather);
       setLastSolarFetch(new Date());
+      // Persist to AsyncStorage for offline use
+      saveWeatherToCache(weather).catch(() => {});
 
       const lvl = weather.activityLevel;
       const color = activityColor(lvl);
@@ -735,33 +862,113 @@ export default function HUDScreen() {
         }
       }
     } catch (err) {
-      log(`Solar weather fetch error: ${err}`, C.AMBER);
+      log(`Solar weather fetch error: ${err} — trying cached data`, C.AMBER);
+      // Try cached weather
+      const cached = await loadCachedWeather();
+      if (cached) {
+        setSolarWeather(cached.weather);
+        log(`Using cached space weather (${cached.ageMinutes.toFixed(0)}min old)`, C.AMBER);
+      }
     } finally {
       setIsFetchingSolar(false);
     }
   }, [isFetchingSolar, solarDangerFired, log]);
 
-  // ── Fetch TLE data ─────────────────────────────────────────────────────────
-  const fetchTLEData = useCallback(async () => {
-    if (isFetchingTLE) return;
-    setIsFetchingTLE(true);
-    log("Fetching live TLE data from CelesTrak...", C.MUTED);
+  // ── Fetch Privateer Crow's Nest conjunction data ──────────────────────────
+  const fetchConjunctionData = useCallback(async () => {
+    if (isFetchingConj) return;
+    setIsFetchingConj(true);
     try {
-      const gp = await fetchAllSatellites();
-      setAllGP(gp);
-      setLastTLEFetch(new Date());
-      const src = `CelesTrak (celestrak.org) · Dr. T.S. Kelso`;
-      setDataSource(src);
+      const state = await fetchConjunctions();
+      setConjunctions(state);
+      const topEvent = state.events[0];
       log(
-        `TLE data loaded: **${gp.length} satellites** across 7/7 groups.\nSource: ${src}\nPropagation: SGP4/SDP4 via satellite.js v6`,
-        C.VOLT,
+        `PRIVATEER CROW'S NEST UPDATE\n` +
+        `${state.totalCount} conjunction events · ${state.highRiskCount} high-risk (P>1e-4)\n` +
+        (topEvent
+          ? `Top risk: ${topEvent.obj1Name} ↔ ${topEvent.obj2Name}\n` +
+            `P(collision)=${formatProbability(topEvent.collisionProbability3D)} · ` +
+            `Miss dist: ${formatDistance(topEvent.distance)} · ` +
+            `TCA: ${hoursUntilTCA(topEvent.targetMillis).toFixed(1)}h\n` +
+            `Source: Privateer Wayfinder Crow's Nest (wayfinder.privateer.com)`
+          : "No conjunction data available"),
+        state.highRiskCount > 0 ? C.RED : C.CYAN,
         true,
       );
     } catch (err) {
-      log(`TLE fetch error: ${err}`, C.RED);
+      log(`Conjunction data fetch error: ${err}`, C.AMBER);
     } finally {
-      setIsFetchingTLE(false);
+      setIsFetchingConj(false);
     }
+  }, [isFetchingConj, log]);
+
+  // ── Fetch TLE data (with offline fallback) ────────────────────────────────────────
+  const fetchTLEData = useCallback(async () => {
+    if (isFetchingTLE) return;
+    setIsFetchingTLE(true);
+
+    // Check connectivity first
+    const net = await checkConnectivity();
+    setConnectivity(net.state);
+    const online = net.isConnected && net.isInternetReachable;
+    setIsOffline(!online);
+
+    if (online) {
+      log("Fetching live TLE data from CelesTrak...", C.MUTED);
+      try {
+        const gp = await fetchAllSatellites();
+        setAllGP(gp);
+        setLastTLEFetch(new Date());
+        // Persist to AsyncStorage for offline use
+        saveTLEsToCache(gp).catch(() => {});
+        const src = `CelesTrak (celestrak.org) · Dr. T.S. Kelso`;
+        setDataSource(src);
+        log(
+          `TLE data loaded: **${gp.length} satellites** across 7/7 groups.\nSource: ${src}\nPropagation: SGP4/SDP4 via satellite.js v6`,
+          C.VOLT,
+          true,
+        );
+      } catch (err) {
+        log(`TLE fetch error: ${err} — falling back to offline data`, C.AMBER);
+        // Network error despite connectivity — use offline fallback
+        const offline = await getOfflineTLEs();
+        setAllGP(offline.tles);
+        setLastTLEFetch(offline.cachedAt);
+        setDataSource(
+          offline.source === "cache"
+            ? `OFFLINE · Cached ${offline.ageHours.toFixed(1)}h ago`
+            : `OFFLINE · Fallback snapshot (${offline.tles.length} sats)`
+        );
+        log(
+          `OFFLINE MODE: Using ${offline.source === "cache" ? "cached" : "fallback"} TLE data\n` +
+          `${offline.tles.length} satellites · Age: ${offline.ageHours.toFixed(1)}h\n` +
+          `Propagation accuracy degrades ~1km/day per day of TLE age.`,
+          C.AMBER,
+          true,
+        );
+      }
+    } else {
+      // No connectivity — use offline data immediately
+      log(`OFFLINE — No network (${net.type}). Loading cached orbital data...`, C.AMBER);
+      const offline = await getOfflineTLEs();
+      setAllGP(offline.tles);
+      setLastTLEFetch(offline.cachedAt);
+      setDataSource(
+        offline.source === "cache"
+          ? `OFFLINE · Cached ${offline.ageHours.toFixed(1)}h ago`
+          : `OFFLINE · Fallback snapshot (${offline.tles.length} sats)`
+      );
+      log(
+        `OFFLINE MODE ACTIVE\n` +
+        `Data source: ${offline.source === "cache" ? "AsyncStorage cache" : "embedded fallback snapshot"}\n` +
+        `${offline.tles.length} satellites · Age: ${offline.ageHours.toFixed(1)}h\n` +
+        `SGP4 propagation continues. Accuracy: ~${Math.round(offline.ageHours / 24)} km error.\n` +
+        `Will auto-resume live data when network is restored.`,
+        C.AMBER,
+        true,
+      );
+    }
+    setIsFetchingTLE(false);
   }, [isFetchingTLE, log]);
 
   // ── Propagate satellites → telemetry events ────────────────────────────────
@@ -864,6 +1071,7 @@ export default function HUDScreen() {
     doHealthCheck();
     fetchTLEData();
     fetchSolarData();
+    fetchConjunctionData(); // Privateer Crow's Nest
 
     const healthInterval = setInterval(doHealthCheck, 10_000);
     const propInterval   = setInterval(propagateAll, 5_000);
@@ -871,12 +1079,15 @@ export default function HUDScreen() {
     const tleInterval    = setInterval(fetchTLEData, 6 * 3600 * 1000);
     // Solar weather refresh every 5 minutes
     const solarInterval  = setInterval(fetchSolarData, 5 * 60 * 1000);
+    // Conjunction data refresh every 6 hours (Privateer updates daily)
+    const conjInterval   = setInterval(fetchConjunctionData, 6 * 3600 * 1000);
 
     return () => {
       clearInterval(healthInterval);
       clearInterval(propInterval);
       clearInterval(tleInterval);
       clearInterval(solarInterval);
+      clearInterval(conjInterval);
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-depsdeps
 
@@ -931,6 +1142,35 @@ export default function HUDScreen() {
     if (text === "CACHE") {
       const report = dataParser.formatStatsReport();
       log(report, C.VOLT);
+      return;
+    }
+    if (text === "OFFLINE") {
+      const summary = await getOfflineSummary();
+      log(summary, isOffline ? C.AMBER : C.VOLT);
+      return;
+    }
+    if (text === "CONJ") {
+      if (!conjunctions) {
+        log("Conjunction data not yet loaded. Fetching from Privateer Crow's Nest...", C.CYAN);
+        fetchConjunctionData();
+        return;
+      }
+      const top5 = conjunctions.events.slice(0, 5);
+      log(
+        `PRIVATEER CROW'S NEST CONJUNCTION REPORT\n` +
+        `Total events: ${conjunctions.totalCount} · High-risk (P>1e-4): ${conjunctions.highRiskCount}\n` +
+        `Fetched: ${conjunctions.fetchedAt.toISOString().slice(11, 19)}Z\n` +
+        `Source: wayfinder.privateer.com/data/conjunctions.json\n\n` +
+        `TOP 5 BY COLLISION PROBABILITY:\n` +
+        top5.map((ev, i) =>
+          `${i + 1}. ${ev.obj1Name} \u2194 ${ev.obj2Name}\n` +
+          `   P(3D)=${formatProbability(ev.collisionProbability3D)} · P(2D)=${formatProbability(ev.collisionProbability2D)}\n` +
+          `   Miss: ${formatDistance(ev.distance)} · Speed: ${formatSpeed(ev.speed)}\n` +
+          `   TCA: ${ev.targetDateTime.slice(0, 16)}Z (${hoursUntilTCA(ev.targetMillis).toFixed(1)}h)\n` +
+          `   ${ev.obj1Type} vs ${ev.obj2Type}`
+        ).join("\n"),
+        conjunctions.highRiskCount > 0 ? C.RED : C.CYAN,
+      );
       return;
     }
     if (text === "SOLAR") {
@@ -1056,10 +1296,10 @@ export default function HUDScreen() {
         </View>
 
         {/* ── DATA SOURCE STRIP ── */}
-        {dataSource ? (
+          {dataSource ? (
           <View style={styles.dataSourceStrip}>
-            <Text style={styles.dataSourceText}>
-              ✓ {allGP.length} SATS · CELESTRAK · {lastTLEFetch?.toISOString().slice(11, 19) ?? ""}Z
+            <Text style={[styles.dataSourceText, isOffline ? { color: C.AMBER } : undefined]}>
+              {isOffline ? "⚠ OFFLINE · " : "✓ "}{allGP.length} SATS · {isOffline ? dataSource : `CELESTRAK · ${lastTLEFetch?.toISOString().slice(11, 19) ?? ""}Z`}
             </Text>
             {criticalCount > 0 && (
               <Text style={[styles.dataSourceText, { color: C.RED }]}>
@@ -1176,6 +1416,48 @@ export default function HUDScreen() {
             </BentoCard>
           )}
 
+          {/* ── PRIVATEER CROW'S NEST CONJUNCTION CARD ── */}
+          {conjunctions && conjunctions.events.length > 0 && (
+            <BentoCard
+              label="CONJUNCTION RISK · PRIVATEER CROW'S NEST"
+              labelRight={`${conjunctions.totalCount} EVENTS`}
+              accentColor={conjunctions.highRiskCount > 0 ? C.RED : C.CYAN}
+            >
+              <View style={styles.solarRow}>
+                {/* High-risk count */}
+                <View style={styles.solarCell}>
+                  <Text style={styles.solarCellLabel}>HIGH RISK</Text>
+                  <Text style={[styles.solarCellValue, { color: conjunctions.highRiskCount > 0 ? C.RED : C.VOLT }]}>
+                    {conjunctions.highRiskCount}
+                  </Text>
+                </View>
+                {/* Top 4 conjunction events */}
+                {conjunctions.events.slice(0, 4).map((ev, i) => (
+                  <View key={ev.cdmName ?? String(i)} style={[styles.solarCell, { minWidth: 80, flex: 2 }]}>
+                    <Text style={styles.solarCellLabel} numberOfLines={1}>
+                      {ev.obj1Name.slice(0, 10)} ↔ {ev.obj2Name.slice(0, 10)}
+                    </Text>
+                    <Text style={[styles.solarCellValue, {
+                      fontSize: 10,
+                      color: ev.collisionProbability3D >= 1e-4 ? C.RED :
+                             ev.collisionProbability3D >= 1e-5 ? C.AMBER : C.VOLT
+                    }]}>
+                      {formatProbability(ev.collisionProbability3D)}
+                    </Text>
+                    <Text style={[styles.solarCellLabel, { fontSize: 6 }]}>
+                      {formatDistance(ev.distance)} · {hoursUntilTCA(ev.targetMillis).toFixed(0)}h
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            </BentoCard>
+          )}
+          {isFetchingConj && !conjunctions && (
+            <BentoCard label="CONJUNCTION RISK · PRIVATEER CROW'S NEST" accentColor={C.CYAN}>
+              <Text style={[styles.emptyFeedText, { color: C.CYAN }]}>FETCHING CONJUNCTION DATA...</Text>
+            </BentoCard>
+          )}
+
           {/* ── ORBITAL ARC VISUALISER (collapses on CRISIS) ── */}
           {showOrbitalArc && (
             <BentoCard
@@ -1188,6 +1470,7 @@ export default function HUDScreen() {
                 threatLevel={threatLevel}
                 lastPropagated={lastPropagated}
                 groundTracks={groundTracks}
+                conjunctions={conjunctions}
               />
             </BentoCard>
           )}
@@ -1291,7 +1574,7 @@ export default function HUDScreen() {
             style={styles.commandInput}
             value={command}
             onChangeText={setCommand}
-            placeholder="ENTER COMMAND... (try: SATS)"
+            placeholder="ENTER COMMAND... (try: SATS, CONJ, SOLAR, OFFLINE)"
             placeholderTextColor={C.MUTED2}
             autoCapitalize="characters"
             autoCorrect={false}

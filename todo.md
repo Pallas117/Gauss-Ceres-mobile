@@ -167,3 +167,44 @@
 - [x] Handle antimeridian crossing (lon wraps from 180 to -180) by splitting track into segments
 - [x] Label each ground track with satellite name and threat %
 - [x] Mark current position dot prominently on each track
+
+## Offline Capability & Local Training
+
+- [ ] Build lib/offline-store.ts — AsyncStorage persistence for last-known TLE data and space weather
+- [ ] Embed static fallback TLE snapshot (ISS, GPS, BeiDou, stations) as bundled JSON for cold-start offline
+- [ ] Detect network connectivity using expo-network and set offline/online mode
+- [ ] Show OFFLINE MODE banner in HUD header when disconnected
+- [ ] Continue SGP4 propagation from last-known TLEs when offline (with epoch-age warning)
+- [ ] Show data staleness indicator (TLE age in hours) when operating offline
+- [ ] Persist last-known solar weather data to AsyncStorage for offline display
+- [ ] Auto-resume live data fetch when connectivity is restored
+- [ ] Build lib/local-trainer.ts — session learning system that logs operator decisions and threat patterns
+- [ ] Log every ACKNOWLEDGE, ABORT, ISOLATE, OVERRIDE, LOCKDOWN action with context (satellite, threat%, event type)
+- [ ] Log every command sent to M1 and the response received
+- [ ] Accumulate threat pattern library: satellite → historical threat scores over time
+- [ ] Build offline M1 reasoning fallback using local pattern matching (no network required)
+- [ ] Add TRAIN command to console — shows session learning stats (decisions logged, patterns learned)
+- [ ] Add HISTORY command to console — shows last 20 operator decisions from local log
+- [ ] Add PATTERNS command to console — shows top threat patterns identified from session history
+- [ ] Persist training data across app restarts using AsyncStorage
+- [ ] Show "OFFLINE REASONING" label in console when using local pattern matching
+- [ ] Add offline mode indicator to the node status header
+- [ ] Export training log as JSON via share sheet (EXPORT command)
+
+## Deep Blue Theme & 3D Orbital Visualiser
+
+- [ ] Update theme.config.js — deep blue base (#020B18), navy surface (#071428), electric blue accent (#1E90FF), volt green kept for alerts
+- [ ] Update tailwind.config.js with new deep blue tokens
+- [ ] Update app splash screen background to deep blue
+- [ ] Build 3D-perspective orbital visualiser — Earth sphere at center, inclined elliptical orbit rings in 3D projection
+- [ ] Render top-3 risk satellite orbits as inclined ellipses with correct inclination angle and RAAN
+- [ ] Show satellite position dot moving along its orbit ring
+- [ ] Add depth perspective — orbits behind Earth are dimmer/dashed, orbits in front are bright
+- [ ] Add interactive tilt/rotation — user can drag to rotate the orbital view
+- [ ] Add depth slider control — adjust viewing elevation angle (0° = top-down, 60° = oblique)
+- [ ] Tap a satellite dot to show name, threat%, altitude, velocity in a tooltip
+- [ ] Color-code orbit rings: rank 1 = red, rank 2 = amber, rank 3 = volt green
+- [ ] Animate satellite dots moving along orbit rings in real time
+- [ ] Show Earth as a deep blue sphere with lat/lon grid lines
+- [ ] Add LEO/MEO/GEO altitude reference rings
+- [ ] Show solar direction indicator (sun position relative to Earth)

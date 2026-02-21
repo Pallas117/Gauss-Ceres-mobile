@@ -14,6 +14,16 @@ import {
   type OrbitalState,
 } from "../lib/satellite-service";
 
+// ─── Mock expo-network ──────────────────────────────────────────────────────
+vi.mock("expo-network", () => ({
+  getNetworkStateAsync: () => Promise.resolve({
+    isConnected: true,
+    isInternetReachable: true,
+    type: "WIFI",
+  }),
+  NetworkStateType: { WIFI: "WIFI", CELLULAR: "CELLULAR", NONE: "NONE", UNKNOWN: "UNKNOWN" },
+}));
+
 // ─── Mock AsyncStorage ────────────────────────────────────────────────────────
 const store: Record<string, string> = {};
 vi.mock("@react-native-async-storage/async-storage", () => ({
@@ -555,5 +565,207 @@ describe("Solar Weather Service", () => {
     const posRisk = computeSolarThreat(base, "LEO", 400);
     const negRisk = computeSolarThreat({ ...base, solarWind: { ...base.solarWind, bzGsm: -15 } }, "LEO", 400);
     expect(negRisk).toBeGreaterThan(posRisk);
+  });
+});
+
+// ─── Conjunction Service Tests ────────────────────────────────────────────────
+describe("conjunction-service", () => {
+  it("formatProbability formats scientific notation correctly", async () => {
+    const { formatProbability } = await import("../lib/conjunction-service");
+    // Actual format: "1.00×10⁻⁴" (uses superscript digits)
+    expect(formatProbability(1e-4)).toMatch(/1\.00×10/);
+    expect(formatProbability(0)).toBe("0.0×10⁰");
+    expect(formatProbability(1.5e-6)).toMatch(/1\.50×10/);
+  });
+
+  it("formatDistance formats metres correctly", async () => {
+    const { formatDistance } = await import("../lib/conjunction-service");
+    expect(formatDistance(500)).toBe("500m");
+    expect(formatDistance(1500)).toBe("1.5km");
+    expect(formatDistance(10000)).toBe("10.0km");
+  });
+
+  it("formatSpeed formats m/s correctly", async () => {
+    const { formatSpeed } = await import("../lib/conjunction-service");
+    // formatSpeed uses toFixed(1) — 1 decimal place
+    expect(formatSpeed(1000)).toBe("1.0km/s");
+    expect(formatSpeed(500)).toBe("0.5km/s");
+  });
+
+  it("hoursUntilTCA returns positive for future TCA", async () => {
+    const { hoursUntilTCA } = await import("../lib/conjunction-service");
+    const futureMs = Date.now() + 3 * 3600 * 1000; // 3 hours from now
+    expect(hoursUntilTCA(futureMs)).toBeGreaterThan(2.9);
+    expect(hoursUntilTCA(futureMs)).toBeLessThan(3.1);
+  });
+
+  it("hoursUntilTCA returns negative for past TCA", async () => {
+    const { hoursUntilTCA } = await import("../lib/conjunction-service");
+    const pastMs = Date.now() - 2 * 3600 * 1000; // 2 hours ago
+    expect(hoursUntilTCA(pastMs)).toBeLessThan(0);
+  });
+
+  it("parseConjunctionData handles valid raw data", async () => {
+    const { parseConjunctionData } = await import("../lib/conjunction-service");
+    const raw = [
+      {
+        id: "test-1",
+        targetDateTime: "2026-03-01T12:00:00Z",
+        targetMillis: 1740830400000,
+        speed: 14000,
+        distance: 250,
+        objId1: "25544",
+        objId2: "55000",
+        obj1Name: "ISS (ZARYA)",
+        obj2Name: "STARLINK-30594",
+        obj1Type: "Satellite",
+        obj2Type: "Satellite",
+        collisionProbability2D: 2.5e-4,
+        collisionProbability3D: 1.8e-4,
+        cdmName: "CDM-2026-001",
+        generatedDate: "2026-02-21T00:00:00Z",
+        obj1PX: 6371000, obj1PY: 0, obj1PZ: 0,
+        obj1VX: 0, obj1VY: 7700, obj1VZ: 0,
+        obj2PX: 6371200, obj2PY: 0, obj2PZ: 0,
+        obj2VX: 0, obj2VY: 7700, obj2VZ: 0,
+      },
+    ];
+    const state = parseConjunctionData(raw);
+    expect(state.events).toHaveLength(1);
+    expect(state.totalCount).toBe(1);
+    expect(state.highRiskCount).toBe(1); // P > 1e-4
+    expect(state.source).toBe("privateer-crowsnest");
+    expect(state.events[0].obj1Name).toBe("ISS (ZARYA)");
+  });
+
+  it("parseConjunctionData sorts by 3D probability descending", async () => {
+    const { parseConjunctionData } = await import("../lib/conjunction-service");
+    const makeEvent = (id: string, p3d: number) => ({
+      id,
+      targetDateTime: "2026-03-01T12:00:00Z",
+      targetMillis: 1740830400000,
+      speed: 10000,
+      distance: 500,
+      objId1: "1", objId2: "2",
+      obj1Name: "SAT-A", obj2Name: "SAT-B",
+      obj1Type: "Satellite", obj2Type: "Satellite",
+      collisionProbability2D: p3d * 0.8,
+      collisionProbability3D: p3d,
+      cdmName: `CDM-${id}`,
+      generatedDate: "2026-02-21T00:00:00Z",
+      obj1PX: 0, obj1PY: 0, obj1PZ: 0,
+      obj1VX: 0, obj1VY: 0, obj1VZ: 0,
+      obj2PX: 0, obj2PY: 0, obj2PZ: 0,
+      obj2VX: 0, obj2VY: 0, obj2VZ: 0,
+    });
+    const state = parseConjunctionData([
+      makeEvent("low", 1e-6),
+      makeEvent("high", 1e-3),
+      makeEvent("mid", 1e-5),
+    ]);
+    expect(state.events[0].collisionProbability3D).toBe(1e-3);
+    expect(state.events[1].collisionProbability3D).toBe(1e-5);
+    expect(state.events[2].collisionProbability3D).toBe(1e-6);
+  });
+
+  it("highRiskCount counts events with P(3D) >= 1e-4", async () => {
+    const { parseConjunctionData } = await import("../lib/conjunction-service");
+    const makeEvent = (id: string, p3d: number) => ({
+      id,
+      targetDateTime: "2026-03-01T12:00:00Z",
+      targetMillis: 1740830400000,
+      speed: 10000, distance: 500,
+      objId1: "1", objId2: "2",
+      obj1Name: "SAT-A", obj2Name: "SAT-B",
+      obj1Type: "Satellite", obj2Type: "Satellite",
+      collisionProbability2D: p3d * 0.8,
+      collisionProbability3D: p3d,
+      cdmName: `CDM-${id}`, generatedDate: "2026-02-21T00:00:00Z",
+      obj1PX: 0, obj1PY: 0, obj1PZ: 0,
+      obj1VX: 0, obj1VY: 0, obj1VZ: 0,
+      obj2PX: 0, obj2PY: 0, obj2PZ: 0,
+      obj2VX: 0, obj2VY: 0, obj2VZ: 0,
+    });
+    const state = parseConjunctionData([
+      makeEvent("a", 1e-3),   // high risk
+      makeEvent("b", 1e-4),   // exactly at threshold — high risk
+      makeEvent("c", 9.9e-5), // just below threshold — not high risk
+      makeEvent("d", 1e-6),   // low risk
+    ]);
+    expect(state.highRiskCount).toBe(2);
+  });
+});
+
+// ─── Offline Store Tests ──────────────────────────────────────────────────────
+describe("offline-store", () => {
+  beforeEach(() => {
+    Object.keys(store).forEach(k => delete store[k]);
+    vi.resetModules();
+  });
+
+  it("saveTLEsToCache persists TLEs to AsyncStorage", async () => {
+    const { saveTLEsToCache, loadCachedTLEs } = await import("../lib/offline-store");
+    const tles: CelesTrakGP[] = [ISS_GP, GPS_GP];
+    await saveTLEsToCache(tles);
+    const result = await loadCachedTLEs();
+    expect(result).not.toBeNull();
+    expect(result!.tles).toHaveLength(2);
+    expect(result!.tles[0].NORAD_CAT_ID).toBe(25544);
+  });
+
+  it("loadCachedTLEs returns null when cache is empty", async () => {
+    const { loadCachedTLEs } = await import("../lib/offline-store");
+    expect(await loadCachedTLEs()).toBeNull();
+  });
+
+  it("getOfflineTLEs returns fallback when no cache", async () => {
+    const { getOfflineTLEs } = await import("../lib/offline-store");
+    const result = await getOfflineTLEs();
+    expect(result.source).toBe("fallback");
+    expect(result.tles.length).toBeGreaterThan(0);
+    expect(result.ageHours).toBeGreaterThan(0);
+  });
+
+  it("getOfflineTLEs returns cache when available", async () => {
+    const { saveTLEsToCache, getOfflineTLEs } = await import("../lib/offline-store");
+    await saveTLEsToCache([ISS_GP, GPS_GP]);
+    const result = await getOfflineTLEs();
+    expect(result.source).toBe("cache");
+    expect(result.tles).toHaveLength(2);
+  });
+
+  it("FALLBACK_TLE_SNAPSHOT contains ISS", async () => {
+    const { FALLBACK_TLES } = await import("../lib/offline-store");
+    const iss = FALLBACK_TLES.find(t => t.NORAD_CAT_ID === 25544);
+    expect(iss).toBeDefined();
+    expect(iss!.OBJECT_NAME).toContain("ISS");
+  });
+
+  it("startOfflineSession records session to AsyncStorage", async () => {
+    const { startOfflineSession, loadOfflineSessions } = await import("../lib/offline-store");
+    const id = await startOfflineSession("cache", 2.5);
+    expect(id).toMatch(/^offline-/);
+    const sessions = await loadOfflineSessions();
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].tleSource).toBe("cache");
+    expect(sessions[0].tleAgeHours).toBe(2.5);
+  });
+
+  it("endOfflineSession updates session with duration and stats", async () => {
+    const { startOfflineSession, endOfflineSession, loadOfflineSessions } = await import("../lib/offline-store");
+    const id = await startOfflineSession("fallback", 48);
+    await endOfflineSession(id, 150, 12);
+    const sessions = await loadOfflineSessions();
+    expect(sessions[0].eventsProcessed).toBe(150);
+    expect(sessions[0].commandsSent).toBe(12);
+    expect(sessions[0].endedAt).toBeTruthy();
+  });
+
+  it("getOfflineSummary returns a non-empty string", async () => {
+    const { getOfflineSummary } = await import("../lib/offline-store");
+    const summary = await getOfflineSummary();
+    expect(typeof summary).toBe("string");
+    expect(summary.length).toBeGreaterThan(50);
+    expect(summary).toContain("OFFLINE");
   });
 });
