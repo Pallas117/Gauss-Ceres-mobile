@@ -100,3 +100,37 @@
 - [x] Integrate operator events into live telemetry feed with [OP] badge
 - [x] Add tab bar: HUD (tab 1) and OPERATOR (tab 2)
 - [x] Add icon mappings for new tabs
+
+## Solar Flare Risk Integration
+
+- [x] Research NOAA SWPC API endpoints for live solar flare data
+- [x] Build solar-weather-service.ts to fetch live space weather from NOAA SWPC
+- [x] Fetch current solar flare probabilities (C/M/X class) from NOAA 3-day forecast
+- [x] Fetch active geomagnetic storm alerts (Kp index) from NOAA alerts feed
+- [x] Fetch solar wind speed and density from NOAA real-time solar wind feed
+- [x] Compute per-satellite solar flare threat modifier based on orbit type (LEO/MEO/GEO)
+- [x] Add solar flare threat contribution to per-satellite threatPct calculation
+- [x] Add Solar Weather bento card to HUD with live flare class probabilities
+- [x] Show Kp index and geomagnetic storm level in solar card
+- [x] Show solar wind speed (km/s) and density (p/cm³) in solar card
+- [x] Trigger danger flash for X-class flare probability > 10% or Kp >= 7
+- [x] Color-code solar activity level: green (quiet), amber (active), red (storm)
+- [x] Auto-refresh solar data every 5 minutes
+- [x] Log solar weather events to the Actioning Console
+- [x] Generate new app logo inspired by Gauss's 1801 orbital diagram of Ceres (v3 — blue Earth center)
+- [x] Apply new logo to all icon locations
+
+## Embedded Space Data Parser (Latency Optimisation)
+
+- [x] Build lib/data-parser.ts — embedded binary-packed record format for TLE and SWPC data
+- [x] Implement LRU in-memory cache with TTL per data source (TLE: 6h, SWPC: 5min)
+- [x] Implement delta-update logic — only re-propagate satellites whose TLE epoch has changed
+- [x] Pre-compute and cache satrec objects so satellite.js twoline2satrec is never called twice for the same TLE
+- [x] Implement incremental propagation — only update satellites that have moved < 0.05° since last cycle (delta engine)
+- [x] Add binary packing for orbital state (Float32Array for lat/lon/alt/vel — 4 bytes each vs 8-byte float64)
+- [x] Add request deduplication — prevent parallel fetches of the same endpoint
+- [x] Add stale-while-revalidate pattern for all feeds (serve cached data instantly, refresh in background)
+- [x] Add fetch priority queue — stations/military first, GPS/weather second, science/Galileo/BeiDou third
+- [x] Expose parser stats to HUD console (cache hit rate, parse time, byte savings)
+- [x] Integrate parser into satellite-service.ts and solar-weather-service.ts
+- [x] Add CACHE command to actioning console to show parser performance stats

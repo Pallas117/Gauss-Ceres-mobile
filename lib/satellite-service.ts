@@ -10,6 +10,7 @@
 
 import * as satellite from "satellite.js";
 import type { OMMJsonObject } from "satellite.js";
+import { dataParser, propagateWithCache, eciToGeodetic, eciVelToKms } from "./data-parser";
 
 // ─── CelesTrak GP JSON record ─────────────────────────────────────────────────
 export interface CelesTrakGP {
@@ -64,15 +65,16 @@ export type SatGroupKey = typeof SATELLITE_GROUPS[number]["key"];
 // ─── CelesTrak API base ───────────────────────────────────────────────────────
 const CELESTRAK_BASE = "https://celestrak.org/NORAD/elements/gp.php";
 
-// ─── Fetch GP data for a group ────────────────────────────────────────────────
+// ─── Fetch GP data for a group (via parser cache + deduplication) ────────────
 export async function fetchGroupTLEs(
   group: SatGroupKey,
   signal?: AbortSignal
 ): Promise<CelesTrakGP[]> {
   const url = `${CELESTRAK_BASE}?GROUP=${group}&FORMAT=JSON`;
-  const res = await fetch(url, { signal });
-  if (!res.ok) throw new Error(`CelesTrak HTTP ${res.status} for group=${group}`);
-  const data: CelesTrakGP[] = await res.json();
+  // Use parser's deduplicated, stale-while-revalidate fetch
+  const data = await dataParser.fetchSWPC<CelesTrakGP[]>(url, 6 * 60 * 60 * 1000);
+  // Ingest into parser cache for satrec pre-computation
+  dataParser.ingestGPBatch(data);
   return data;
 }
 
@@ -89,49 +91,84 @@ export async function fetchSatelliteByNorad(
 }
 
 // ─── Propagate a GP record to current position ───────────────────────────────
+// Uses the data parser's satrec cache — json2satrec is called at most once per
+// TLE epoch per satellite, then the cached satrec is reused on every cycle.
 export function propagateGP(gp: CelesTrakGP, date: Date = new Date()): OrbitalState {
   try {
-    const satrec = satellite.json2satrec(gp as unknown as OMMJsonObject);
-    const posVel = satellite.propagate(satrec, date);
+    // Use cached satrec from parser (avoids redundant json2satrec calls)
+    const result = propagateWithCache(gp, date);
+    if (!result) return errorState(gp);
 
-    if (!posVel || !posVel.position || typeof posVel.position === "boolean") {
-      return errorState(gp);
-    }
+    const { posEci, velEci } = result;
+    const { lat, lon, altKm } = eciToGeodetic(posEci, date);
+    const velKms = eciVelToKms(velEci);
 
-    const pos = posVel.position as satellite.EciVec3<number>;
-    const gmst = satellite.gstime(date);
-    const geo = satellite.eciToGeodetic(pos, gmst);
-
-    const lat = satellite.degreesLat(geo.latitude);
-    const lon = satellite.degreesLong(geo.longitude);
-    const altKm = geo.height;
-
-    if (!posVel.velocity || typeof posVel.velocity === "boolean") {
-      return errorState(gp);
-    }
-    const vel = posVel.velocity as satellite.EciVec3<number>;
-    const velKms = Math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2);
-
-    // TLE epoch age in hours
     const epochDate = new Date(gp.EPOCH);
     const epochAge = (date.getTime() - epochDate.getTime()) / 3_600_000;
-
-    // Orbital period in minutes = 1440 / mean_motion (rev/day)
     const period = 1440 / gp.MEAN_MOTION;
 
-    return {
+    const state: OrbitalState = {
       noradId: gp.NORAD_CAT_ID,
       name: gp.OBJECT_NAME.trim(),
       objectId: gp.OBJECT_ID,
-      lat,
-      lon,
-      altKm,
-      velKms,
+      lat, lon, altKm, velKms,
       inclination: gp.INCLINATION,
-      period,
-      epochAge,
+      period, epochAge,
       error: false,
     };
+
+    // Store packed state in cache for delta-check on next cycle
+    dataParser.setPackedState(gp.NORAD_CAT_ID, dataParser.packState(state));
+    return state;
+  } catch {
+    return errorState(gp);
+  }
+}
+
+/**
+ * Propagate with delta-check — skips full propagation if satellite
+ * has moved less than DELTA_THRESHOLD degrees since last cycle.
+ * Returns cached state if delta is below threshold.
+ */
+export function propagateGPDelta(gp: CelesTrakGP, date: Date = new Date()): OrbitalState {
+  try {
+    // Quick propagation to check new position
+    const result = propagateWithCache(gp, date);
+    if (!result) return errorState(gp);
+
+    const { posEci, velEci } = result;
+    const { lat, lon, altKm } = eciToGeodetic(posEci, date);
+
+    // Delta check — if position hasn't changed enough, return cached state
+    if (!dataParser.needsUpdate(gp.NORAD_CAT_ID, lat, lon)) {
+      const packed = dataParser.getPackedState(gp.NORAD_CAT_ID);
+      if (packed) {
+        return dataParser.unpackState(packed, {
+          noradId: gp.NORAD_CAT_ID,
+          name: gp.OBJECT_NAME.trim(),
+          objectId: gp.OBJECT_ID,
+          error: false,
+        });
+      }
+    }
+
+    const velKms = eciVelToKms(velEci);
+    const epochDate = new Date(gp.EPOCH);
+    const epochAge = (date.getTime() - epochDate.getTime()) / 3_600_000;
+    const period = 1440 / gp.MEAN_MOTION;
+
+    const state: OrbitalState = {
+      noradId: gp.NORAD_CAT_ID,
+      name: gp.OBJECT_NAME.trim(),
+      objectId: gp.OBJECT_ID,
+      lat, lon, altKm, velKms,
+      inclination: gp.INCLINATION,
+      period, epochAge,
+      error: false,
+    };
+
+    dataParser.setPackedState(gp.NORAD_CAT_ID, dataParser.packState(state));
+    return state;
   } catch {
     return errorState(gp);
   }
@@ -258,22 +295,23 @@ export interface TelemetryEvent {
   isOperator?: boolean;
 }
 
-// ─── Fetch all satellite groups in parallel ───────────────────────────────────
-export async function fetchAllSatellites(): Promise<CelesTrakGP[]> {
-  const results = await Promise.allSettled(
-    SATELLITE_GROUPS.map(g => fetchGroupTLEs(g.key))
-  );
-  const all: CelesTrakGP[] = [];
-  for (const result of results) {
-    if (result.status === "fulfilled") {
-      all.push(...result.value);
-    }
-  }
-  // Deduplicate by NORAD_CAT_ID
-  const seen = new Set<number>();
-  return all.filter(gp => {
-    if (seen.has(gp.NORAD_CAT_ID)) return false;
-    seen.add(gp.NORAD_CAT_ID);
-    return true;
+// ─── Fetch all satellite groups via parser priority queue ─────────────────────
+export async function fetchAllSatellites(
+  onGroupLoaded?: (key: string, records: CelesTrakGP[]) => void
+): Promise<CelesTrakGP[]> {
+  const groups = SATELLITE_GROUPS.map(g => ({
+    key: g.key,
+    url: `${CELESTRAK_BASE}?GROUP=${g.key}&FORMAT=JSON`,
+    priority: g.priority,
+  }));
+
+  // Use the parser's priority fetch queue:
+  //   - Tier 1 (stations) fetched first and awaited
+  //   - Tier 2+ fetched concurrently in background
+  await dataParser.fetchCelesTrakGroups(groups, (key, records) => {
+    onGroupLoaded?.(key, records);
   });
+
+  // Return all cached GP records (deduplicated by NORAD_CAT_ID)
+  return dataParser.getAllGPs();
 }

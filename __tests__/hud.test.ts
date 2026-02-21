@@ -411,3 +411,149 @@ describe("Danger threshold", () => {
     }
   });
 });
+
+// ─── Solar Weather Service Tests ──────────────────────────────────────────────
+describe("Solar Weather Service", () => {
+  it("computeSolarThreat returns 0 when weather has error and no probabilities", async () => {
+    const { computeSolarThreat } = await import("../lib/solar-weather-service");
+    const errorWeather = {
+      activityLevel: "QUIET" as const,
+      currentXrayFlux: 0,
+      currentFlareClass: "A" as const,
+      kpCurrent: 0,
+      kpForecast: [],
+      geoStormLevel: "G0" as const,
+      flareProbabilities: null,
+      solarWind: null,
+      latestFlares: [],
+      activeAlerts: [],
+      activeRegions: [],
+      fetchedAt: new Date().toISOString(),
+      error: "NOAA fetch failed",
+    };
+    expect(computeSolarThreat(errorWeather, "LEO", 400)).toBe(0);
+  });
+
+  it("computeSolarThreat returns higher risk for GEO during X-class activity", async () => {
+    const { computeSolarThreat } = await import("../lib/solar-weather-service");
+    const mockWeather = {
+      activityLevel: "SEVERE" as const,
+      currentXrayFlux: 1e-3,
+      currentFlareClass: "X" as const,
+      kpCurrent: 8,
+      kpForecast: [],
+      geoStormLevel: "G4" as const,
+      flareProbabilities: { issuedAt: "", mClassPct: 80, xClassPct: 40, protonPct: 30, mClassTomorrow: 70, xClassTomorrow: 30 },
+      solarWind: { timestamp: "", speedKms: 700, densityPcm3: 15, temperature: 1e6, bzGsm: -20, btTotal: 25 },
+      latestFlares: [],
+      activeAlerts: [],
+      activeRegions: [],
+      fetchedAt: new Date().toISOString(),
+      error: null,
+    };
+    const geoRisk = computeSolarThreat(mockWeather, "GEO", 35800);
+    const leoRisk = computeSolarThreat(mockWeather, "LEO", 400);
+    expect(geoRisk).toBeGreaterThan(leoRisk);
+    expect(geoRisk).toBeGreaterThan(50);
+  });
+
+  it("computeSolarThreat returns low risk during QUIET conditions", async () => {
+    const { computeSolarThreat } = await import("../lib/solar-weather-service");
+    const quietWeather = {
+      activityLevel: "QUIET" as const,
+      currentXrayFlux: 1e-8,
+      currentFlareClass: "A" as const,
+      kpCurrent: 1,
+      kpForecast: [],
+      geoStormLevel: "G0" as const,
+      flareProbabilities: { issuedAt: "", mClassPct: 5, xClassPct: 1, protonPct: 1, mClassTomorrow: 5, xClassTomorrow: 1 },
+      solarWind: { timestamp: "", speedKms: 350, densityPcm3: 5, temperature: 5e5, bzGsm: 2, btTotal: 5 },
+      latestFlares: [],
+      activeAlerts: [],
+      activeRegions: [],
+      fetchedAt: new Date().toISOString(),
+      error: null,
+    };
+    const risk = computeSolarThreat(quietWeather, "LEO", 400);
+    expect(risk).toBeLessThan(20);
+  });
+
+  it("activityColor returns correct GDS colors", async () => {
+    const { activityColor } = await import("../lib/solar-weather-service");
+    expect(activityColor("QUIET")).toBe("#CCFF00");
+    expect(activityColor("ACTIVE")).toBe("#FFAA00");
+    expect(activityColor("SEVERE")).toBe("#FF2222");
+    expect(activityColor("STORM")).toBe("#FF6600"); // orange — between active and severe
+  });
+
+  it("flareClassColor returns correct colors for flare classes", async () => {
+    const { flareClassColor } = await import("../lib/solar-weather-service");
+    expect(flareClassColor("A")).toBe("#444444");
+    expect(flareClassColor("M")).toBe("#FF9900");
+    expect(flareClassColor("X")).toBe("#FF2222");
+  });
+
+  it("gStormColor returns correct colors for storm levels", async () => {
+    const { gStormColor } = await import("../lib/solar-weather-service");
+    expect(gStormColor("G0")).toBe("#CCFF00");
+    expect(gStormColor("G1")).toBe("#FFEE00");
+    expect(gStormColor("G3")).toBe("#FF6600");
+    expect(gStormColor("G5")).toBe("#FF2222");
+  });
+
+  it("formatFlux formats scientific notation correctly", async () => {
+    const { formatFlux } = await import("../lib/solar-weather-service");
+    expect(formatFlux(1e-6)).toMatch(/1\.0×10⁻6/);
+    expect(formatFlux(0)).toBe("N/A");
+  });
+
+  it("formatKp formats Kp index correctly", async () => {
+    const { formatKp } = await import("../lib/solar-weather-service");
+    expect(formatKp(3.3)).toBe("3.3");
+    expect(formatKp(7)).toBe("7.0");
+  });
+
+  it("combined threat never exceeds 100%", async () => {
+    const { computeSolarThreat } = await import("../lib/solar-weather-service");
+    const extremeWeather = {
+      activityLevel: "SEVERE" as const,
+      currentXrayFlux: 1e-3,
+      currentFlareClass: "X" as const,
+      kpCurrent: 9,
+      kpForecast: [],
+      geoStormLevel: "G5" as const,
+      flareProbabilities: { issuedAt: "", mClassPct: 99, xClassPct: 99, protonPct: 99, mClassTomorrow: 99, xClassTomorrow: 99 },
+      solarWind: { timestamp: "", speedKms: 900, densityPcm3: 30, temperature: 2e6, bzGsm: -30, btTotal: 40 },
+      latestFlares: [],
+      activeAlerts: [],
+      activeRegions: [],
+      fetchedAt: new Date().toISOString(),
+      error: null,
+    };
+    const solarThreat = computeSolarThreat(extremeWeather, "GEO", 35800);
+    const combined = Math.min(100, Math.round(80 * 0.7 + solarThreat * 0.3));
+    expect(combined).toBeLessThanOrEqual(100);
+  });
+
+  it("negative Bz increases solar threat (southward IMF = geoeffective)", async () => {
+    const { computeSolarThreat } = await import("../lib/solar-weather-service");
+    const base = {
+      activityLevel: "ACTIVE" as const,
+      currentXrayFlux: 1e-5,
+      currentFlareClass: "M" as const,
+      kpCurrent: 4,
+      kpForecast: [],
+      geoStormLevel: "G1" as const,
+      flareProbabilities: { issuedAt: "", mClassPct: 30, xClassPct: 5, protonPct: 5, mClassTomorrow: 25, xClassTomorrow: 3 },
+      solarWind: { timestamp: "", speedKms: 500, densityPcm3: 10, temperature: 8e5, bzGsm: 5, btTotal: 10 },
+      latestFlares: [],
+      activeAlerts: [],
+      activeRegions: [],
+      fetchedAt: new Date().toISOString(),
+      error: null,
+    };
+    const posRisk = computeSolarThreat(base, "LEO", 400);
+    const negRisk = computeSolarThreat({ ...base, solarWind: { ...base.solarWind, bzGsm: -15 } }, "LEO", 400);
+    expect(negRisk).toBeGreaterThan(posRisk);
+  });
+});

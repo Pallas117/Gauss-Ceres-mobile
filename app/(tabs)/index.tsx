@@ -33,6 +33,7 @@ import Svg, { Circle, Path, Line, Ellipse, Text as SvgText } from "react-native-
 import {
   fetchAllSatellites,
   propagateGP,
+  propagateGPDelta,
   classifyEvent,
   formatCoords,
   formatSatName,
@@ -44,6 +45,18 @@ import {
   operatorEventToTelemetry,
   type OperatorRiskEvent,
 } from "@/lib/operator-store";
+import {
+  fetchSpaceWeather,
+  computeSolarThreat,
+  activityColor,
+  gStormColor,
+  flareClassColor,
+  formatFlux,
+  formatKp,
+  type SpaceWeatherState,
+  type SolarActivityLevel,
+} from "@/lib/solar-weather-service";
+import { dataParser } from "@/lib/data-parser";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 const TAILSCALE_IP = "100.x.x.x"; // Replace with your Tailscale IP
@@ -498,6 +511,12 @@ export default function HUDScreen() {
   const [dangerEvent, setDangerEvent]   = useState<TelemetryEvent | null>(null);
   const [seenDangerIds, setSeenDangerIds] = useState<Set<string>>(new Set());
 
+  // Solar weather state
+  const [solarWeather, setSolarWeather]       = useState<SpaceWeatherState | null>(null);
+  const [isFetchingSolar, setIsFetchingSolar] = useState(false);
+  const [lastSolarFetch, setLastSolarFetch]   = useState<Date | null>(null);
+  const [solarDangerFired, setSolarDangerFired] = useState(false);
+
   // Contextual UI: collapse non-essential panels on CRISIS
   const [threatLevel, setThreatLevel]   = useState<"NOMINAL" | "WARNING" | "CRISIS">("NOMINAL");
   const [showOrbitalArc, setShowOrbitalArc] = useState(true);
@@ -540,6 +559,61 @@ export default function HUDScreen() {
     }
   }, []);
 
+  // ── Fetch Solar Weather ──────────────────────────────────────────────────────
+  const fetchSolarData = useCallback(async () => {
+    if (isFetchingSolar) return;
+    setIsFetchingSolar(true);
+    try {
+      const weather = await fetchSpaceWeather();
+      setSolarWeather(weather);
+      setLastSolarFetch(new Date());
+
+      const lvl = weather.activityLevel;
+      const color = activityColor(lvl);
+      const fp = weather.flareProbabilities;
+
+      log(
+        `SOLAR WEATHER UPDATE\n` +
+        `Activity: ${lvl} · Flare class: ${weather.currentFlareClass}\n` +
+        `M-class prob: ${fp?.mClassPct ?? "N/A"}% · X-class prob: ${fp?.xClassPct ?? "N/A"}%\n` +
+        `Kp index: ${formatKp(weather.kpCurrent)} · Storm: ${weather.geoStormLevel}\n` +
+        (weather.solarWind ? `Solar wind: ${Math.round(weather.solarWind.speedKms)} km/s · Bz: ${weather.solarWind.bzGsm.toFixed(1)} nT` : "") +
+        (weather.error ? `\n⚠ ${weather.error}` : ""),
+        color,
+      );
+
+      // Danger flash for X-class flare probability > 10% or Kp >= 7
+      const isXDanger = (fp?.xClassPct ?? 0) >= 10;
+      const isKpDanger = weather.kpCurrent >= 7;
+      if ((isXDanger || isKpDanger) && !solarDangerFired) {
+        setSolarDangerFired(true);
+        const syntheticEvent: TelemetryEvent = {
+          id: `solar-${Date.now()}`,
+          timestamp: new Date().toISOString().slice(11, 19),
+          type: "CRITICAL",
+          satName: "SOLAR WEATHER ALERT",
+          noradId: 0,
+          coordinates: `Kp=${formatKp(weather.kpCurrent)} · ${weather.geoStormLevel}`,
+          detail: isXDanger
+            ? `X-class flare probability: ${fp?.xClassPct}% — all satellite operators at risk`
+            : `Geomagnetic storm Kp=${formatKp(weather.kpCurrent)} — radiation belt injection risk`,
+          threatPct: isXDanger ? Math.min(95, (fp?.xClassPct ?? 0) * 5) : Math.min(95, weather.kpCurrent * 10),
+          altKm: 0,
+          velKms: 0,
+          isReal: true as const,
+        };
+        setDangerEvent(syntheticEvent);
+        if (Platform.OS !== "web") {
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+        }
+      }
+    } catch (err) {
+      log(`Solar weather fetch error: ${err}`, C.AMBER);
+    } finally {
+      setIsFetchingSolar(false);
+    }
+  }, [isFetchingSolar, solarDangerFired, log]);
+
   // ── Fetch TLE data ─────────────────────────────────────────────────────────
   const fetchTLEData = useCallback(async () => {
     if (isFetchingTLE) return;
@@ -575,20 +649,25 @@ export default function HUDScreen() {
       .map(operatorEventToTelemetry);
 
     const now = new Date();
-    const computed: TelemetryEvent[] = allGP
+      const computed: TelemetryEvent[] = allGP
       .slice(0, 80)
       .map(gp => {
-        const state = propagateGP(gp, now);
+        // Use delta propagation — skips full SGP4 if satellite moved < 0.05°
+        const state = propagateGPDelta(gp, now);
         const { type, detail, threatPct } = classifyEvent(state);
+        // Add solar flare risk modifier based on orbit type and current space weather
+        const orbitType = state.altKm > 35000 ? "GEO" : state.altKm > 2000 ? "MEO" : "LEO";
+        const solarThreat = solarWeather ? computeSolarThreat(solarWeather, orbitType, state.altKm) : 0;
+        const combinedThreat = Math.min(100, Math.round(threatPct * 0.7 + solarThreat * 0.3));
         return {
           id: `${gp.NORAD_CAT_ID}-${now.getTime()}`,
           timestamp: now.toISOString().slice(11, 19),
-          type,
+          type: combinedThreat >= 85 ? "CRITICAL" : type,
           satName: formatSatName(gp.OBJECT_NAME),
           noradId: gp.NORAD_CAT_ID,
           coordinates: formatCoords(state.lat, state.lon),
-          detail,
-          threatPct,
+          detail: solarThreat > 20 ? `${detail} · ☀ Solar: +${solarThreat}%` : detail,
+          threatPct: combinedThreat,
           altKm: state.altKm,
           velKms: state.velKms,
           isReal: true as const,
@@ -631,23 +710,27 @@ export default function HUDScreen() {
     }
   }, [allGP, seenDangerIds]);
 
-  // ── Initialise ─────────────────────────────────────────────────────────────
+  // ── Initialise ─────────────────────────────────────────────────────────
   useEffect(() => {
     log("GAUSS MISSION HUD ONLINE. JUDITH M1 NODE INITIALIZING...", C.VOLT, true);
     doHealthCheck();
     fetchTLEData();
+    fetchSolarData();
 
     const healthInterval = setInterval(doHealthCheck, 10_000);
     const propInterval   = setInterval(propagateAll, 5_000);
     // TLE refresh every 6 hours
     const tleInterval    = setInterval(fetchTLEData, 6 * 3600 * 1000);
+    // Solar weather refresh every 5 minutes
+    const solarInterval  = setInterval(fetchSolarData, 5 * 60 * 1000);
 
     return () => {
       clearInterval(healthInterval);
       clearInterval(propInterval);
       clearInterval(tleInterval);
+      clearInterval(solarInterval);
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []); // eslint-disable-line react-hooks/exhaustive-depsdeps
 
   // Re-run propagation when GP data arrives
   useEffect(() => {
@@ -694,6 +777,38 @@ export default function HUDScreen() {
         `Ping count: ${pingCount}\n` +
         `Last ping: ${lastPingTime}`,
         nodeStatus === "ONLINE" ? C.VOLT : C.RED,
+      );
+      return;
+    }
+    if (text === "CACHE") {
+      const report = dataParser.formatStatsReport();
+      log(report, C.VOLT);
+      return;
+    }
+    if (text === "SOLAR") {
+      if (!solarWeather) {
+        log("Solar weather data not yet loaded. Fetching...", C.AMBER);
+        fetchSolarData();
+        return;
+      }
+      const fp = solarWeather.flareProbabilities;
+      const sw = solarWeather.solarWind;
+      log(
+        `SOLAR WEATHER REPORT (NOAA SWPC)\n` +
+        `Activity level: ${solarWeather.activityLevel}\n` +
+        `Current X-ray flux: ${formatFlux(solarWeather.currentXrayFlux)}\n` +
+        `Current flare class: ${solarWeather.currentFlareClass}\n` +
+        `M-class prob (today): ${fp?.mClassPct ?? "N/A"}%\n` +
+        `X-class prob (today): ${fp?.xClassPct ?? "N/A"}%\n` +
+        `Proton event prob:    ${fp?.protonPct ?? "N/A"}%\n` +
+        `Kp index: ${formatKp(solarWeather.kpCurrent)} · Storm: ${solarWeather.geoStormLevel}\n` +
+        (sw ? `Solar wind: ${Math.round(sw.speedKms)} km/s · Density: ${sw.densityPcm3.toFixed(1)} p/cm³\n` +
+              `Bz (GSM): ${sw.bzGsm.toFixed(1)} nT · Bt: ${sw.btTotal.toFixed(1)} nT\n` : "") +
+        `Recent flares: ${solarWeather.latestFlares.slice(0, 3).map(f => f.maxClass).join(", ") || "None"}\n` +
+        `Active regions: ${solarWeather.activeRegions.length}\n` +
+        `Last updated: ${solarWeather.fetchedAt.slice(11, 19)}Z\n` +
+        `Source: NOAA SWPC (swpc.noaa.gov)`,
+        activityColor(solarWeather.activityLevel),
       );
       return;
     }
@@ -819,6 +934,94 @@ export default function HUDScreen() {
 
         {/* ── BENTO BOX LAYOUT ── */}
         <View style={styles.bentoGrid}>
+
+          {/* ── SOLAR WEATHER BENTO CARD ── */}
+          {solarWeather && (
+            <BentoCard
+              label="SOLAR WEATHER · NOAA SWPC"
+              labelRight={solarWeather.activityLevel}
+              labelColor={activityColor(solarWeather.activityLevel)}
+              accentColor={activityColor(solarWeather.activityLevel)}
+            >
+              <View style={styles.solarRow}>
+                {/* Flare class */}
+                <View style={styles.solarCell}>
+                  <Text style={styles.solarCellLabel}>FLARE</Text>
+                  <Text style={[styles.solarCellValue, { color: flareClassColor(solarWeather.currentFlareClass) }]}>
+                    {solarWeather.currentFlareClass}
+                  </Text>
+                </View>
+                {/* M-class probability */}
+                <View style={styles.solarCell}>
+                  <Text style={styles.solarCellLabel}>M-CLASS</Text>
+                  <Text style={[styles.solarCellValue, {
+                    color: (solarWeather.flareProbabilities?.mClassPct ?? 0) >= 30 ? C.ORANGE : C.VOLT
+                  }]}>
+                    {solarWeather.flareProbabilities?.mClassPct ?? "--"}%
+                  </Text>
+                </View>
+                {/* X-class probability */}
+                <View style={styles.solarCell}>
+                  <Text style={styles.solarCellLabel}>X-CLASS</Text>
+                  <Text style={[styles.solarCellValue, {
+                    color: (solarWeather.flareProbabilities?.xClassPct ?? 0) >= 5 ? C.RED : C.VOLT
+                  }]}>
+                    {solarWeather.flareProbabilities?.xClassPct ?? "--"}%
+                  </Text>
+                </View>
+                {/* Kp index */}
+                <View style={styles.solarCell}>
+                  <Text style={styles.solarCellLabel}>Kp INDEX</Text>
+                  <Text style={[styles.solarCellValue, { color: gStormColor(solarWeather.geoStormLevel) }]}>
+                    {formatKp(solarWeather.kpCurrent)}
+                  </Text>
+                </View>
+                {/* G-storm level */}
+                <View style={styles.solarCell}>
+                  <Text style={styles.solarCellLabel}>G-STORM</Text>
+                  <Text style={[styles.solarCellValue, { color: gStormColor(solarWeather.geoStormLevel) }]}>
+                    {solarWeather.geoStormLevel}
+                  </Text>
+                </View>
+                {/* Solar wind speed */}
+                {solarWeather.solarWind && (
+                  <View style={styles.solarCell}>
+                    <Text style={styles.solarCellLabel}>SW km/s</Text>
+                    <Text style={[styles.solarCellValue, {
+                      color: solarWeather.solarWind.speedKms > 600 ? C.AMBER : C.VOLT
+                    }]}>
+                      {Math.round(solarWeather.solarWind.speedKms)}
+                    </Text>
+                  </View>
+                )}
+                {/* Bz */}
+                {solarWeather.solarWind && (
+                  <View style={styles.solarCell}>
+                    <Text style={styles.solarCellLabel}>Bz nT</Text>
+                    <Text style={[styles.solarCellValue, {
+                      color: solarWeather.solarWind.bzGsm < -10 ? C.RED :
+                             solarWeather.solarWind.bzGsm < -5  ? C.AMBER : C.VOLT
+                    }]}>
+                      {solarWeather.solarWind.bzGsm.toFixed(1)}
+                    </Text>
+                  </View>
+                )}
+              </View>
+              {/* Active alerts strip */}
+              {solarWeather.activeAlerts.length > 0 && (
+                <View style={styles.solarAlertStrip}>
+                  <Text style={[styles.solarAlertText, { color: C.AMBER }]} numberOfLines={1}>
+                    ⚠ {solarWeather.activeAlerts[0].severity}: {solarWeather.activeAlerts[0].message.slice(0, 80).replace(/\r\n/g, " ")}
+                  </Text>
+                </View>
+              )}
+            </BentoCard>
+          )}
+          {isFetchingSolar && !solarWeather && (
+            <BentoCard label="SOLAR WEATHER · NOAA SWPC" accentColor={C.AMBER}>
+              <Text style={[styles.emptyFeedText, { color: C.AMBER }]}>FETCHING SPACE WEATHER DATA...</Text>
+            </BentoCard>
+          )}
 
           {/* ── ORBITAL ARC VISUALISER (collapses on CRISIS) ── */}
           {showOrbitalArc && (
@@ -1425,5 +1628,47 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: C.VOLT,
     letterSpacing: 2,
+  },
+
+  // ── Solar weather card ──────────────────────────────────────────────────────
+  solarRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 4,
+  },
+  solarCell: {
+    minWidth: 52,
+    flex: 1,
+    backgroundColor: C.SURFACE2,
+    borderWidth: 1,
+    borderColor: C.BORDER2,
+    paddingHorizontal: 6,
+    paddingVertical: 5,
+    alignItems: "center",
+    gap: 2,
+  },
+  solarCellLabel: {
+    fontFamily: FONT.bold,
+    fontSize: 6,
+    color: C.MUTED,
+    letterSpacing: 1,
+  },
+  solarCellValue: {
+    fontFamily: FONT.bold,
+    fontSize: 13,
+    color: C.VOLT,
+    letterSpacing: 0.5,
+  },
+  solarAlertStrip: {
+    marginTop: 6,
+    borderTopWidth: 1,
+    borderTopColor: C.BORDER2,
+    paddingTop: 5,
+  },
+  solarAlertText: {
+    fontFamily: FONT.regular,
+    fontSize: 8,
+    letterSpacing: 0.5,
+    lineHeight: 12,
   },
 });
